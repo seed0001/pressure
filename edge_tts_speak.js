@@ -1,6 +1,6 @@
 const { MsEdgeTTS, OUTPUT_FORMAT } = require("msedge-tts");
 
-const VOICE = "en-US-AndrewNeural";
+const VOICE = process.argv[3] || "en-IE-EmilyNeural";
 const FORMAT = OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3;
 
 function streamToBuffer(stream) {
@@ -20,7 +20,7 @@ function streamToBuffer(stream) {
 
   const tts = new MsEdgeTTS();
   await tts.setMetadata(VOICE, FORMAT);
-  const result = await tts.toStream(text.slice(0, 1200));
+  const result = await tts.toStream(text.slice(0, 5000));
   const audio = await streamToBuffer(result.audioStream);
   if (!audio.length) {
     throw new Error("No audio returned from Edge TTS");

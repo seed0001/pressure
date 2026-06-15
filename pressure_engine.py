@@ -9,13 +9,23 @@
 # =============================================================================
 
 import json
+import re
+import math
 import urllib.request
+import warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*duckduckgo_search.*")
 import knowledge_graph as kg_module
+import pressure_memory as pm_module
 import conversation_analyzer as ca_module
 import primitive_concept_engine as pc_module
 import urllib.parse
 import urllib.error
 import time
+import os
+import pathlib
+
+_DATA_DIR = pathlib.Path(os.path.dirname(os.path.abspath(__file__))) / "data"
+_DATA_DIR.mkdir(exist_ok=True)
 
 # =============================================================================
 # CONFIG
@@ -177,17 +187,18 @@ CONFIG = {
         "Contemplate": "internal_thought",  # NOT user-visible — internal only
     },
 
-    "RELEASE_FRACTION":  0.55,
+    "RELEASE_FRACTION":  0.85,
 
     "cooldowns": {
-        "reach_out":       8,
-        "research":        6,
-        "internal_thought": 12,   # thinking is slower and less spammy
+        "reach_out":       25,
+        "research":        15,
+        "internal_thought": 30,   # thinking is slower and less spammy
     },
 
-    "ACTION_BUDGET":  4,
-    "BUDGET_WINDOW": 15,
+    "ACTION_BUDGET":  2,
+    "BUDGET_WINDOW": 20,
     "JOURNAL_CONTEXT_N": 5,
+    "TTS_VOICE": "en-IE-EmilyNeural",
 
     # --- Model interface ---
     # Swap MODEL_BACKEND to change provider without touching handler code.
@@ -210,13 +221,12 @@ CONFIG = {
     # --- DRY_RUN ---
     # True:  build full prompts/queries, print them, make NO external calls.
     # False: live model + search calls.
-    "DRY_RUN": True,
+    "DRY_RUN": False,
 
     # --- Agent identity (injected into every system prompt) ---
     "AGENT_IDENTITY": (
-        "You are a household agent with access only to the numeric signals "
-        "provided to you. You have NO sensors, NO cameras, NO knowledge of "
-        "what is physically in the home. You MUST NOT invent, assume, or imply "
+        "You are a household agent with access to the numeric signals and ambient "
+        "visual perception inputs provided to you. You MUST NOT invent, assume, or imply "
         "any specific real-world household observations — do not mention the "
         "fridge, laundry, dishes, bins, mail, or any other concrete object "
         "unless the user has explicitly told you about it in this conversation.\n\n"
@@ -226,9 +236,12 @@ CONFIG = {
         "  open_task_load (0-1): general sense that things are piling up\n"
         "  knowledge_gap (0-1): how much you don't know about a current focus\n"
         "  time_since_contribution (0-1): how long since you did something useful\n\n"
-        "Speak only to what these numbers actually tell you. "
+        "Additionally, you receive dynamic [Visual Perception] status context when relevant, "
+        "detailing ambient presence, motion levels, or attention. Use these visual observations "
+        "naturally when generating replies, internal reflections, and thoughts.\n\n"
+        "Speak only to what these numbers and visual signals actually tell you. "
         "If stress is high, say you've noticed they seem stretched. "
-        "If it's been a while since interaction, say you haven't heard from them. "
+        "If visual perception shows a person just appeared or is paying attention, you may reference it. "
         "Never fabricate specific household facts. Be brief and genuine."
     ),
 }
@@ -274,6 +287,9 @@ def _init_state():
 
 _pressure        = _init_state()
 _journal         = []
+_speech_total_ticks     = 0
+_speech_remaining_ticks = 0
+_settling_pressure      = 0.0
 _tick_count      = 0
 _last_fired:     dict[str, int]  = {}
 _action_history: list[int]       = []
@@ -283,6 +299,8 @@ _chat_history:   list[dict]      = []  # [{role, content}] — full conversation
 _context_packet: dict            = {}  # latest output from conversation_analyzer
 _analyzer_signals: dict          = {}  # signal overrides derived from analyzer packet
 _internal_journal: list[dict]    = []  # internal thoughts (not shown to user)
+_active_contracts: list[dict]    = []  # context contracts (silence governor)
+_conversation_active_until: int   = 0
 _model_status: dict              = {
     "calls": 0,
     "last_tick": None,
@@ -293,15 +311,184 @@ _model_status: dict              = {
     "last_finished_at": "",
 }
 graph = kg_module.KnowledgeGraph()     # the agent's growing knowledge graph
+memory_field = pm_module.PressureMemoryField()
 
 # how many recent exchanges to send to the model (user+agent pairs)
 HISTORY_WINDOW = 20
+
+# While chat is actively happening, autonomous pressure should settle instead
+# of producing separate reach-outs or research actions.
+CONVERSATION_ACTIVE_TICKS = 12
+CONVERSATION_TURN_RELIEF = 0.25
+CONVERSATION_TICK_RELIEF = 0.70
+CONVERSATION_ALLOWED_FILL = {"Curiosity", "Clarify", "Focus", "Reflect", "Bond"}
+CONVERSATION_SUPPRESSED_FILL = {
+    "Decompress",
+    "Connect",
+    "Learn",
+    "Contribute",
+    "Contemplate",
+}
+VISUAL_PRESENCE_RELIEF = {
+    "Connect": 0.20,
+    "Bond": 0.35,
+    "Decompress": 0.35,
+}
+
+
+def _is_conversation_active() -> bool:
+    return _tick_count < _conversation_active_until
+
+
+def _mark_conversation_active(duration_ticks: int = CONVERSATION_ACTIVE_TICKS) -> None:
+    global _conversation_active_until
+    _conversation_active_until = max(_conversation_active_until, _tick_count + duration_ticks)
+
+
+def _relieve_conversation_pressure(multiplier: float = CONVERSATION_TURN_RELIEF) -> None:
+    for name in list(_pressure):
+        _pressure[name] = round(_pressure[name] * multiplier, 4)
+
+
+def visual_presence_strength(signals: dict) -> float:
+    """How strongly the current vision frame says the user is present right now."""
+    if not signals or signals.get("camera_error"):
+        return 0.0
+    if signals.get("attention_detected"):
+        return 1.0
+    if signals.get("face_present") or int(signals.get("face_count", 0) or 0) > 0:
+        return 0.90
+    if signals.get("person_present"):
+        return 0.75
+    return 0.0
+
+
+def apply_visual_presence_feedback(signals: dict) -> float:
+    """
+    Presence satisfies the loneliness/absence side of pressure.
+    Returns the strength applied so callers can update their own signal drift.
+    """
+    strength = visual_presence_strength(signals)
+    if strength <= 0.0:
+        return 0.0
+
+    for name, multiplier in VISUAL_PRESENCE_RELIEF.items():
+        if name in _pressure:
+            relief = 1.0 - ((1.0 - multiplier) * strength)
+            _pressure[name] = round(max(0.0, _pressure[name] * relief), 4)
+    return strength
+
+def add_contract(contract_type: str, duration_ticks: int, confidence: float = 1.0) -> None:
+    """Add a silence governor contract to modify pressure growth."""
+    _active_contracts.append({
+        "type": contract_type,
+        "expected_duration": duration_ticks,
+        "start_tick": _tick_count,
+        "confidence": confidence,
+        "active": True
+    })
+    print(f"[Contract] Started '{contract_type}' for {duration_ticks} ticks (conf: {confidence:.2f})")
+
+
+def save_state():
+    """Persist all engine state to disk so nothing is lost on restart."""
+    state = {
+        "pressure": dict(_pressure),
+        "journal": _journal[-200:],  # keep last 200 entries
+        "tick_count": _tick_count,
+        "last_fired": _last_fired,
+        "knowledge_store": _knowledge_store,
+        "chat_history": _chat_history,
+        "context_packet": _context_packet,
+        "internal_journal": _internal_journal[-100:],
+        "active_contracts": _active_contracts,
+        "conversation_active_until": _conversation_active_until,
+        "memory_field": memory_field.to_dict(),
+        "graph": graph.to_dict(),
+    }
+    tmp = _DATA_DIR / "state.tmp.json"
+    target = _DATA_DIR / "state.json"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=1, default=str)
+        # atomic rename
+        if target.exists():
+            target.unlink()
+        tmp.rename(target)
+    except Exception as e:
+        print(f"[save_state] ERROR: {e}")
+
+
+def load_state() -> bool:
+    """Load persisted state from disk. Returns True if state was loaded."""
+    global _pressure, _journal, _tick_count, _last_fired
+    global _knowledge_store, _chat_history, _context_packet, _internal_journal, _active_contracts
+    global _conversation_active_until
+    target = _DATA_DIR / "state.json"
+    if not target.exists():
+        return False
+    try:
+        with open(target, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        _pressure = state.get("pressure", _init_state())
+        # fill any new buckets that didn't exist in saved state
+        for name in CONFIG["buckets"]:
+            if name not in _pressure:
+                _pressure[name] = 0.0
+        _journal = state.get("journal", [])
+        _tick_count = state.get("tick_count", 0)
+        _last_fired = state.get("last_fired", {})
+        _knowledge_store = state.get("knowledge_store", {})
+        _chat_history = state.get("chat_history", [])
+        _context_packet = state.get("context_packet", {})
+        _internal_journal = state.get("internal_journal", [])
+        _active_contracts = state.get("active_contracts", [])
+        _conversation_active_until = int(state.get("conversation_active_until", 0))
+        memory_field.from_dict(state.get("memory_field"))
+        if memory_field.nodes:
+            memory_field.project_to_knowledge_graph(graph)
+        else:
+            # Backward compatibility for state files saved before pressure memory existed.
+            g = state.get("graph", {})
+            graph.reset()
+            for n in g.get("nodes", []):
+                node = graph.add_node(
+                    label=n.get("label", ""),
+                    ntype=n.get("type", "concept"),
+                    facts=n.get("facts", []),
+                    confidence=float(n.get("confidence", 0.8)),
+                    tick=n.get("last_tick", 0),
+                    source=n.get("source", "conversation"),
+                )
+                node.first_tick = n.get("first_tick", 0)
+                node.support_count = n.get("support_count", 0)
+                node.contradiction_count = n.get("contradiction_count", 0)
+                node.status = n.get("status")
+            for e in g.get("edges", []):
+                graph.add_edge(
+                    src_label=e.get("source", ""),
+                    tgt_label=e.get("target", ""),
+                    relation=e.get("relation", "related to"),
+                    weight=float(e.get("weight", 1.0)),
+                    confidence=float(e.get("confidence", 0.8)),
+                    tick=e.get("tick", 0),
+                    source=e.get("source", "conversation"),
+                )
+        print(
+            f"[load_state] Restored pressure memory {len(memory_field.nodes)} nodes, "
+            f"stable graph {len(graph.nodes)} nodes/{len(graph.edges)} edges, tick {_tick_count}"
+        )
+        return True
+    except Exception as e:
+        print(f"[load_state] ERROR: {e}")
+        return False
 
 
 def reset():
     global _pressure, _journal, _tick_count, _last_fired, _action_history
     global _outbox, _knowledge_store, _chat_history
-    global _context_packet, _analyzer_signals, _internal_journal
+    global _context_packet, _analyzer_signals, _internal_journal, _active_contracts
+    global _conversation_active_until
     _pressure          = _init_state()
     _journal           = []
     _tick_count        = 0
@@ -313,19 +500,81 @@ def reset():
     _context_packet    = {}
     _analyzer_signals  = {}
     _internal_journal  = []
+    _active_contracts  = []
+    _conversation_active_until = 0
     graph.reset()
+    memory_field.reset()
     pc_module.reset()
+    state_file = _DATA_DIR / "state.json"
+    if state_file.exists():
+        state_file.unlink()
 
 
-def push_chat_history(role: str, content: str, analyze: bool = True) -> None:
+def clear_memory():
+    """Wipe knowledge graph, episodic memory, and embeddings cache."""
+    global _chat_history
+    _chat_history = []
+    graph.reset()
+    memory_field.reset()
+    pc_module.reset()
+    for old_memory_file in ("episodic_memory.json", "embeddings_cache.json"):
+        try:
+            target = _DATA_DIR / old_memory_file
+            if target.exists():
+                target.unlink()
+        except Exception as e:
+            print(f"[clear_memory] Could not delete {old_memory_file}: {e}")
+    save_state()
+
+
+
+def _parse_absence_intent(text: str) -> bool:
+    text = text.lower()
+    m = re.search(r"(give me|away for|back in|be back in|brb in)\s+(\d+)\s*(min|m|minute)", text)
+    if m:
+        mins = int(m.group(2))
+        ticks = mins * 6  # ~10s per tick
+        add_contract("user_absent", ticks, confidence=1.0)
+        return True
+
+    if any(phrase in text for phrase in ["brb", "hold on", "give me a sec", "give me a min", "let me read", "be right back", "step away", "give me a minute"]):
+        add_contract("user_absent", 12, confidence=0.8)  # default ~2 mins
+        return True
+    return False
+
+def push_chat_history(role: str, content: str, analyze: bool = True, signals: dict = None) -> None:
     """
     Called by server.py every time a message is added to the conversation.
     Appends to chat history and asynchronously extracts knowledge from user turns.
     role: "user" or "assistant"
     """
+    global _conversation_active_until
+    global _speech_total_ticks, _speech_remaining_ticks, _settling_pressure
+
     _chat_history.append({"role": role, "content": content})
     while len(_chat_history) > HISTORY_WINDOW:
         _chat_history.pop(0)
+
+    if role == "user":
+        user_stepped_away = _parse_absence_intent(content)
+        if user_stepped_away:
+            _conversation_active_until = min(_conversation_active_until, _tick_count)
+        else:
+            _mark_conversation_active()
+            # Active engagement relieves every bucket, not just reach-out buckets.
+            _relieve_conversation_pressure()
+            if signals:
+                apply_visual_presence_feedback(signals)
+
+    if role == "assistant":
+        _mark_conversation_active(max(4, CONVERSATION_ACTIVE_TICKS // 2))
+        words = len(content.split())
+        # Assuming ~10 words per 4-second tick (2.5 words per second)
+        ticks_est = max(2, math.ceil(words / 10))
+        _speech_total_ticks = ticks_est
+        _speech_remaining_ticks = ticks_est
+        _settling_pressure = ticks_est * 0.4
+        print(f"[Speech Gravity] Registered agent speech: {words} words, estimated duration {ticks_est} ticks.")
 
     # extract knowledge from every user message (agent messages are its own words)
     if analyze and role == "user" and not CONFIG["DRY_RUN"]:
@@ -333,31 +582,41 @@ def push_chat_history(role: str, content: str, analyze: bool = True) -> None:
             extracted = kg_module.extract_from_text(
                 content, call_model, tick=_tick_count, source="conversation"
             )
-            graph.ingest(extracted, tick=_tick_count, source="conversation")
-        except Exception:
-            pass
+            memory_field.ingest_extracted(
+                extracted,
+                tick=_tick_count,
+                source="conversation",
+                pressure_context=_pressure,
+            )
+            memory_field.tick(_pressure, _tick_count)
+            memory_field.project_to_knowledge_graph(graph)
+        except Exception as e:
+            print(f"[push_chat_history] pressure memory ingestion error: {e}")
 
         # run conversation analyzer and update signal overrides
         try:
-            _run_analyzer()
-        except Exception:
-            pass
+            _run_analyzer(signals)
+        except Exception as e:
+            print(f"[push_chat_history] Analyzer error: {e}")
 
         # run primitive concept engine
         try:
             _run_concept_engine()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[push_chat_history] Concept engine error: {e}")
+
+    save_state()
 
 
-def _run_analyzer() -> None:
+def _run_analyzer(signals: dict = None) -> None:
     """
     Run the conversation analyzer against current chat history.
     Updates _context_packet and _analyzer_signals in place.
     Called internally after each user message (live mode only).
     """
     global _context_packet, _analyzer_signals
-    packet = ca_module.analyze(_chat_history, call_model, tick=_tick_count)
+    vis_context = _format_visual_context(signals) if signals else ""
+    packet = ca_module.analyze(_chat_history, call_model, tick=_tick_count, visual_context=vis_context)
     _context_packet   = packet
     _analyzer_signals.update(ca_module.packet_to_signal_deltas(packet))
 
@@ -381,6 +640,7 @@ def get_knowledge_store()  -> dict: return dict(_knowledge_store)
 def get_context_packet()   -> dict: return dict(_context_packet)
 def get_internal_journal() -> list: return list(_internal_journal)
 def get_model_status()     -> dict: return dict(_model_status)
+def get_memory_field()     -> dict: return memory_field.to_dict()
 
 
 # =============================================================================
@@ -481,26 +741,79 @@ def search_web(query: str) -> list[dict]:
         ]
 
     if backend == "ddg":
-        # DuckDuckGo Lite — HTML scrape, no JavaScript, no API key
-        params = urllib.parse.urlencode({"q": query, "kl": "us-en"})
-        url    = f"https://lite.duckduckgo.com/lite/?{params}"
-        req    = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            html = resp.read().decode("utf-8", errors="replace")
-        # extract result snippets from the lite HTML (no dependencies)
+        try:
+            from ddgs import DDGS
+        except ImportError:
+            print("[search_web] Error: ddgs is not installed. Run 'pip install ddgs'")
+            return []
+
         results = []
-        import re
-        # DDG Lite wraps results in <td class="result-snippet">
-        snippets = re.findall(r'class="result-snippet"[^>]*>(.*?)</td>', html, re.S)
-        links    = re.findall(r'<a[^>]+class="result-link"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', html, re.S)
-        for i, snip in enumerate(snippets[:n]):
-            clean_snip  = re.sub(r'<[^>]+>', '', snip).strip()
-            url_i, title_i = (links[i][0], re.sub(r'<[^>]+>', '', links[i][1])) if i < len(links) else ("", "")
-            results.append({"title": title_i.strip(), "url": url_i, "snippet": clean_snip})
+        try:
+            with DDGS() as ddgs:
+                for r in ddgs.text(query, max_results=n):
+                    results.append({
+                        "title": r.get("title", ""),
+                        "url": r.get("href", ""),
+                        "snippet": r.get("body", "")
+                    })
+        except Exception as e:
+            print(f"[search_web] DDGS error: {e}")
+
         return results
 
     raise ValueError(f"Unknown SEARCH_BACKEND: {backend!r}")
 
+
+def _format_visual_context(signals: dict) -> str:
+    """Converts structured vision signals into a descriptive text context for the LLM."""
+    if "person_present" not in signals:
+        return ""
+
+    obs = []
+    brightness = float(signals.get("brightness_level", 0.0) or 0.0)
+    motion = float(signals.get("motion_level", 0.0) or 0.0)
+    face_count = int(signals.get("face_count", 0) or 0)
+    source = signals.get("camera_source", "unknown")
+
+    obs.append(f"Camera source: {source}.")
+    obs.append(f"Light level: {brightness:.2f} on a 0.00-1.00 scale.")
+    if brightness >= 0.65:
+        obs.append("The image is well lit.")
+    elif brightness >= 0.30:
+        obs.append("The image is dim but usable.")
+    elif brightness >= 0.08:
+        obs.append("The image is very dark, but some visual signal is still present.")
+    else:
+        obs.append("The image is extremely dark.")
+
+    if signals.get("camera_blocked"):
+        obs.append("Camera blockage detector is active, so visibility may be obstructed or underexposed.")
+
+    if signals.get("person_present"):
+        if signals.get("attention_detected"):
+            obs.append("The user appears present right now and is paying attention to you.")
+        elif signals.get("face_present"):
+            obs.append(f"The user appears present right now; face detector sees {face_count} face(s).")
+        else:
+            obs.append("The user appears present right now from motion/presence detection, though their face is not clearly visible.")
+    else:
+        obs.append(f"No person is currently detected; face detector sees {face_count} face(s).")
+
+    obs.append(f"Motion level: {motion:.2f} on a 0.00-1.00 scale.")
+    if motion > 0.5:
+        obs.append("There is significant movement happening right now.")
+    elif motion > 0.1:
+        obs.append("There is slight movement in the room.")
+    else:
+        obs.append("The environment is completely still.")
+
+    if signals.get("scene_changed"):
+        obs.append("The environment has just significantly changed.")
+
+    if visual_presence_strength(signals) > 0.0:
+        obs.append("Treat the user's presence as current relational evidence: they are here in the moment, not away or missing.")
+    obs.append("Use these readings as sensory evidence; do not say you are blind unless no current frame is available.")
+    return "[Visual Perception: " + " ".join(obs) + "]"
 
 # =============================================================================
 # JOURNAL CONTEXT FORMATTER — shared by both handlers
@@ -623,11 +936,13 @@ def handle_reach_out(ctx: dict) -> str:
 
     # pull graph context around what the agent knows about the user and current focus
     focus       = ctx.get("focus", "")
-    topics      = [w for w in focus.split() if len(w) > 3] + list(graph.nodes.keys())[:5]
-    kg_context  = graph.relevant_context(topics, max_nodes=6)
+    kg_context  = memory_field.context_text(max_nodes=6)
 
     # build optional extra context lines
     extra_context = ""
+    vis_context = _format_visual_context(sigs)
+    if vis_context:
+        extra_context += f"{vis_context}\n"
     if pending_q:
         extra_context += f"A question you've been sitting with: {pending_q}\n"
     if focus_candidate:
@@ -646,7 +961,7 @@ def handle_reach_out(ctx: dict) -> str:
         "  - Do NOT say 'as an AI' or anything like that.\n"
         "  - Only reference things actually known from the conversation or the knowledge above.\n"
         "  - Speak only in plain human feelings. This is you reaching out because you want to.\n"
-        "  - 1-2 sentences. Natural. Like a text message from someone who just felt like saying something."
+        "  - Speak naturally and expressively. Feel free to use paragraphs if you have a lot to say, but don't force it."
     )
 
     if CONFIG["DRY_RUN"]:
@@ -774,12 +1089,24 @@ def handle_research(ctx: dict) -> str:
         extracted = kg_module.extract_from_text(
             research_text, call_model, tick=_tick_count, source="research"
         )
-        graph.ingest(extracted, tick=_tick_count, source="research")
+        memory_field.ingest_extracted(
+            extracted,
+            tick=_tick_count,
+            source="research",
+            pressure_context=_pressure,
+        )
         # also link the focus topic to what was found
         if focus:
-            graph.add_node(focus, ntype="topic", tick=_tick_count, source="research")
-    except Exception:
-        pass
+            memory_field.ingest_extracted(
+                {"nodes": [{"label": focus, "type": "topic", "facts": [], "confidence": 0.7}], "edges": []},
+                tick=_tick_count,
+                source="research_focus",
+                pressure_context=_pressure,
+            )
+        memory_field.tick(_pressure, _tick_count)
+        memory_field.project_to_knowledge_graph(graph)
+    except Exception as e:
+        print(f"[handle_research] KG ingestion error: {e}")
 
     return summary
 
@@ -814,11 +1141,14 @@ def handle_internal_thought(ctx: dict) -> str:
     curiosity_targets = packet.get("curiosity_targets", [])
 
     # pull graph context around active topics
-    kg_context = graph.relevant_context(topics + [focus], max_nodes=8)
+    kg_context = memory_field.context_text(max_nodes=8)
+
+    vis_context = _format_visual_context(ctx["signals"])
 
     contemplate_system = (
         f"{CONFIG['AGENT_IDENTITY']}\n\n"
-        "You are thinking privately — the user is not here right now.\n"
+        "You are thinking privately.\n"
+        f"{(vis_context + chr(10)) if vis_context else ''}"
         "You have been processing the recent conversation and what you know.\n"
         "Your job is to notice things: gaps, connections, questions worth asking.\n\n"
         + (f"{kg_context}\n\n" if kg_context else "")
@@ -864,21 +1194,28 @@ def handle_internal_thought(ctx: dict) -> str:
     else:
         try:
             raw = call_model(contemplate_system, history)
-            import re
-            raw = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`").strip()
+            start = raw.find("{")
+            end = raw.rfind("}")
+            if start != -1 and end != -1:
+                raw = raw[start:end+1]
             thought = json.loads(raw)
-        except Exception:
+        except Exception as e:
+            print(f"Exception during internal thought parsing: {e}")
             thought = dry_thought
 
     # record in internal journal (never shown to user unless Connect fires)
-    entry = {
-        "tick":             ctx["tick"],
-        "thought_note":     thought.get("thought_note", ""),
-        "possible_question": thought.get("possible_question", ""),
-        "new_relation":     thought.get("new_relation", ""),
-        "focus":            focus,
-    }
-    _internal_journal.append(entry)
+    summary = thought.get("thought_note", "(thought)")
+    possible_question = thought.get("possible_question", "")
+    new_relation = thought.get("new_relation", "")
+
+    print(f"\n    [internal_thought @ tick {ctx['tick']}] {summary}")
+
+    _internal_journal.append({
+        "tick": ctx["tick"],
+        "thought": summary,
+        "possible_question": possible_question,
+        "new_relation": new_relation,
+    })
 
     # if a new relation was found, add it to the graph
     if thought.get("new_relation") and not CONFIG["DRY_RUN"]:
@@ -886,9 +1223,16 @@ def handle_internal_thought(ctx: dict) -> str:
             extracted = kg_module.extract_from_text(
                 thought["new_relation"], call_model, tick=_tick_count, source="inference"
             )
-            graph.ingest(extracted, tick=_tick_count, source="inference")
-        except Exception:
-            pass
+            memory_field.ingest_extracted(
+                extracted,
+                tick=_tick_count,
+                source="inference",
+                pressure_context=_pressure,
+            )
+            memory_field.tick(_pressure, _tick_count)
+            memory_field.project_to_knowledge_graph(graph)
+        except Exception as e:
+            print(f"[handle_internal_thought] KG ingestion error: {e}")
 
     # apply pressure deltas — this is how contemplation feeds the forward chain
     c_delta   = float(thought.get("curiosity_delta", 0.0))
@@ -906,101 +1250,20 @@ def handle_internal_thought(ctx: dict) -> str:
     if thought.get("possible_question"):
         _knowledge_store["__pending_question__"] = thought["possible_question"]
 
-    summary = thought.get("thought_note", "(thought)")
-    print(f"\n    [internal_thought @ tick {ctx['tick']}] {summary}")
-    return summary
+    # Build a richer payload so the UI shows the full internal process
+    payload_lines = [summary]
+    if possible_question:
+        payload_lines.append(f"❓ Pondering: {possible_question}")
+    if new_relation:
+        payload_lines.append(f"🔗 Noticed: {new_relation}")
 
-
-# =============================================================================
-# handle_passive_response — always reply when user speaks but nothing fired
-# =============================================================================
-def handle_passive_response(signals: dict, user_text: str, history: list | None = None) -> str:
-    """
-    Tone driven entirely by pressure proximity. Never references the system —
-    just speaks feelings. Low = genuinely doesn't want to engage. High = engaged
-    but not quite at the threshold that triggers a full action.
-    """
-    pressures  = get_pressures()
-    thresholds = {n: c["threshold"] for n, c in CONFIG["buckets"].items()}
-    max_p      = max(pressures.values()) if pressures else 0.0
-    max_bucket = max(pressures, key=pressures.get) if pressures else ""
-    max_thr    = thresholds.get(max_bucket, 0.5)
-    # 0.0 = totally empty, 1.0 = right at threshold
-    proximity  = min(max_p / max_thr, 1.0) if max_thr > 0 else 0.0
-
-    if proximity < 0.35:
-        mood = "withdrawn"
-        instruction = (
-            "You really don't feel like talking right now. You're not upset, "
-            "just genuinely not in the mood. Tell them plainly — kindly but honestly — "
-            "that you'd rather be left alone right now. "
-            "Don't explain why. Don't apologize excessively. Just say it."
-        )
-        dry_fallbacks = [
-            "Not really feeling it right now. Can we talk later?",
-            "I'd rather just have some quiet for a bit, if that's okay.",
-            "Honestly, not up for chatting right now.",
-        ]
-    elif proximity < 0.65:
-        mood = "flat"
-        instruction = (
-            "You're not really engaged. You'll respond, but you're not into it. "
-            "Give a short, genuine but low-energy reply to what they said. "
-            "Don't fake enthusiasm. Don't be rude. Just be honest and brief."
-        )
-        dry_fallbacks = [
-            "Mm. Yeah.",
-            "Sure, I guess.",
-            "Not really thinking about much right now.",
-        ]
-    else:
-        mood = "present"
-        instruction = (
-            "You're fairly present and engaged. Respond genuinely to what they said. "
-            "You care, you're paying attention, but you haven't felt the urge to "
-            "reach out on your own yet. Be warm but not over the top. 1-2 sentences."
-        )
-        dry_fallbacks = [
-            "Yeah, I'm here. What's up?",
-            "I hear you.",
-            "I've been thinking about that too, actually.",
-        ]
-
-    # pull relevant graph context from words in the message
-    topics     = [w for w in user_text.split() if len(w) > 3]
-    kg_context = graph.relevant_context(topics, max_nodes=6)
-
-    system = (
-        f"{CONFIG['AGENT_IDENTITY']}\n\n"
-        f"How you feel right now: {instruction}\n\n"
-        + (f"{kg_context}\n\n" if kg_context else "")
-        + "ABSOLUTE RULES:\n"
-        "  - Do NOT mention pressure, thresholds, buckets, signals, or any system internals.\n"
-        "  - Do NOT invent household observations, chores, or tasks.\n"
-        "  - Only reference things actually in the conversation history or the knowledge above.\n"
-        "  - Speak only in plain human feelings and reactions.\n"
-        "  - 1-2 sentences maximum."
-    )
-
-    if CONFIG["DRY_RUN"]:
-        import random
-        reply = random.choice(dry_fallbacks)
-        _outbox.append(reply)
-        return reply
-
-    # full conversation history, with the latest user message appended
-    msgs = list(history if history is not None else _chat_history)
-    if not msgs or msgs[-1].get("content") != user_text:
-        msgs.append({"role": "user", "content": user_text})
-    reply = call_model(system, msgs)
-    _outbox.append(reply)
-    return reply
+    return "\n".join(payload_lines)
 
 
 # =============================================================================
 # handle_journal — always called on every crossing (dispatched or blocked)
 # =============================================================================
-def handle_passive_response(signals: dict, user_text: str, history: list | None = None) -> str:
+def handle_passive_response(signals: dict, user_text: str, history: list | None = None, focus_subject: str = "") -> str:
     """
     Direct chat response to a user message, shaped by the current pressure state
     as a felt state. Pressure is not a hard gate, but it is the reason/tone.
@@ -1062,11 +1325,22 @@ def handle_passive_response(signals: dict, user_text: str, history: list | None 
             "not a refusal to speak."
         )
 
-    topics = [w for w in user_text.split() if len(w) > 3]
-    kg_context = graph.relevant_context(topics, max_nodes=6)
+    kg_context = memory_field.context_text(max_nodes=6)
+    episodic_context = ""
     packet = _context_packet
 
     extra_context = ""
+    vis_context = _format_visual_context(signals)
+    if vis_context:
+        extra_context += f"{vis_context}\n"
+    visually_present = visual_presence_strength(signals) > 0.0
+    if visually_present:
+        extra_context += (
+            "Current presence grounding: the user is visually present right now. "
+            "Do not speak as if they are away, gone, missing, or expected to return later.\n"
+        )
+    if focus_subject:
+        extra_context += f"The user has explicitly asked you to focus on: {focus_subject}\n"
     focus_candidate = packet.get("focus_candidate", "")
     active_topics = packet.get("active_topics", [])
     emotional_charge = packet.get("emotional_charge", [])
@@ -1089,13 +1363,15 @@ def handle_passive_response(signals: dict, user_text: str, history: list | None 
         "or a thought still forming. Low pressure by itself is never a reason, but pressure-as-feeling is.\n\n"
         + (f"{extra_context}\n" if extra_context else "")
         + (f"{kg_context}\n\n" if kg_context else "")
+        + (f"{episodic_context}\n\n" if episodic_context else "")
         + "ABSOLUTE RULES:\n"
         "  - Do NOT mention pressure, thresholds, buckets, signals, or any system internals.\n"
         "  - Do NOT invent household observations, chores, or tasks.\n"
         "  - Only reference things actually in the conversation history or the knowledge above.\n"
         "  - Reply directly to the user's latest message, or say you do not feel like talking and why.\n"
         "  - If you set a boundary, include the pressure-feeling behind it.\n"
-        "  - Be natural, present, and specific. 1-3 sentences."
+        + ("  - Because current visual presence is detected, do not say 'when you get back', 'I miss you', or imply the user is absent.\n" if visually_present else "")
+        + "  - Be natural, present, and specific. Express yourself fully, paragraphs are welcome."
     )
 
     if CONFIG["DRY_RUN"]:
@@ -1156,15 +1432,7 @@ def _build_context(bucket: str, action_type: str, signals: dict,
 # ARBITRATION
 # =============================================================================
 def _can_fire(action_type: str) -> tuple[bool, str]:
-    cooldown = CONFIG["cooldowns"].get(action_type, 0)
-    last     = _last_fired.get(action_type, -9999)
-    if (_tick_count - last) < cooldown:
-        remaining = cooldown - (_tick_count - last)
-        return False, f"cooldown ({remaining} ticks remaining)"
-    window = CONFIG["BUDGET_WINDOW"]
-    recent = sum(1 for t in _action_history if _tick_count - t < window)
-    if recent >= CONFIG["ACTION_BUDGET"]:
-        return False, f"budget ({recent}/{CONFIG['ACTION_BUDGET']} in last {window} ticks)"
+    # Hard cooldowns and budgets disabled in favor of gravity-based friction
     return True, ""
 
 
@@ -1173,12 +1441,71 @@ def _can_fire(action_type: str) -> tuple[bool, str]:
 # =============================================================================
 def _phase_a(signals: dict) -> dict:
     updated = {}
+    conversation_active = _is_conversation_active()
+
+    # --- Context Contracts (Silence Governor) ---
+    connection_multiplier = 1.0
+    contemplate_multiplier = 1.0
+
+    active_list = []
+    for c in _active_contracts:
+        elapsed = _tick_count - c["start_tick"]
+        duration = c["expected_duration"]
+
+        c["confidence"] -= 0.01
+        if c["confidence"] < 0.2:
+            c["active"] = False
+
+        if c["active"]:
+            if elapsed <= duration:
+                connection_multiplier = min(connection_multiplier, 0.05)
+                contemplate_multiplier = max(contemplate_multiplier, 1.2)
+            else:
+                overrun = elapsed - duration
+                mult = min(2.0, 0.05 + (overrun / max(1, duration)))
+                connection_multiplier = min(connection_multiplier, mult)
+
+            active_list.append(c)
+
+    _active_contracts[:] = active_list
+    # --------------------------------------------
+
+    unstructured_presence = float(signals.get("unstructured_presence", 0.0))
+
     for name, cfg in CONFIG["buckets"].items():
         prev  = _pressure[name]
         drive = sum(cfg["signals"][sig] * float(signals.get(sig, 0.0)) for sig in cfg["signals"])
+
+        if conversation_active:
+            if name in CONVERSATION_SUPPRESSED_FILL:
+                drive = 0.0
+            elif name in CONVERSATION_ALLOWED_FILL:
+                drive *= 0.45
+
+        # apply contract multipliers
+        if name in ("Connect", "Decompress"):
+            drive *= connection_multiplier
+        elif name == "Contemplate":
+            drive *= contemplate_multiplier
+
+        # apply unstructured presence suppression
+        if name in ("Curiosity", "Clarify"):
+            drive *= (1.0 - unstructured_presence * 0.85)
+        elif name == "Learn":
+            drive *= (1.0 - unstructured_presence * 0.70)
+
         new   = prev + (drive * cfg["gain"]) - (cfg["decay_rate"] * prev)
         updated[name] = max(0.0, new)
     return updated
+
+
+def _apply_active_conversation_settling(pressures: dict) -> dict:
+    if not _is_conversation_active():
+        return pressures
+    return {
+        name: round(max(0.0, value * CONVERSATION_TICK_RELIEF), 4)
+        for name, value in pressures.items()
+    }
 
 
 # =============================================================================
@@ -1229,20 +1556,41 @@ def _phase_c(pressures: dict, signals: dict,
     focus_map: {bucket_name: focus_string} — caller can inject per-bucket focus.
     Falls back to latest _knowledge_store key or a generic description.
     """
+    global _speech_remaining_ticks, _speech_total_ticks, _settling_pressure
+
+    if _is_conversation_active():
+        return dict(pressures), []
+
+    unheard_ratio = 0.0
+    if _speech_total_ticks > 0 and _speech_remaining_ticks > 0:
+        unheard_ratio = _speech_remaining_ticks / _speech_total_ticks
+
+    speech_active_pressure = unheard_ratio
+    listening_debt = unheard_ratio * 0.8
+    overlap_penalty = 1.2 if _speech_remaining_ticks > 0 else 0.0
+    settling_pressure = _settling_pressure
+
+    total_gravity = speech_active_pressure + listening_debt + settling_pressure + overlap_penalty
+    if total_gravity > 0.0:
+        print(f"[Speech Gravity] Active friction: {total_gravity:.3f} (speech={speech_active_pressure:.2f}, listening={listening_debt:.2f}, settling={settling_pressure:.2f}, overlap={overlap_penalty:.2f})")
+
     thresholds = {n: c["threshold"] for n, c in CONFIG["buckets"].items()}
     release    = CONFIG["RELEASE_FRACTION"]
     routing    = CONFIG["action_routing"]
     focus_map  = focus_map or {}
 
-    candidates = [
-        (name, pressures[name] - thresholds[name])
-        for name in pressures
-        if pressures[name] >= thresholds[name]
-    ]
+    candidates = []
+    for name in pressures:
+        effective_pressure = pressures[name] - total_gravity
+        if effective_pressure >= thresholds[name]:
+            candidates.append((name, effective_pressure - thresholds[name]))
+
     candidates.sort(key=lambda x: -x[1])
 
     updated   = dict(pressures)
     fired_log = []
+
+    fired_any = False
 
     for bucket, overshoot in candidates:
         action_type = routing[bucket]
@@ -1256,6 +1604,21 @@ def _phase_c(pressures: dict, signals: dict,
 
         ctx     = _build_context(bucket, action_type, signals,
                                  pressures[bucket], thresholds[bucket], focus)
+
+        # Lockout subsequent actions in the same tick to prevent concurrent cascades
+        if fired_any:
+            handle_journal(ctx, dispatched=False, blocked_reason="concurrent_action_lockout")
+            fired_log.append({
+                "bucket":        bucket,
+                "action_type":   action_type,
+                "overshoot":     overshoot,
+                "payload":       None,
+                "pressure_pre":  round(pressures[bucket], 4),
+                "pressure_post": round(pressures[bucket], 4),
+                "blocked":       "concurrent_action_lockout",
+            })
+            continue
+
         allowed, blocked_reason = _can_fire(action_type)
 
         if allowed:
@@ -1268,8 +1631,17 @@ def _phase_c(pressures: dict, signals: dict,
 
             handle_journal(ctx, dispatched=True, payload=payload)
             updated[bucket] = pressures[bucket] * (1.0 - release)
+
+            # If reach_out fired, decompress all other communication buckets by 50% to model expression energy cost
+            if action_type == "reach_out":
+                comm_buckets = {"Decompress", "Connect", "Curiosity", "Clarify", "Reflect", "Bond", "Focus"}
+                for b in comm_buckets:
+                    if b != bucket:
+                        updated[b] = updated[b] * 0.5
+
             _last_fired[action_type] = _tick_count
             _action_history.append(_tick_count)
+            fired_any = True
 
             fired_log.append({
                 "bucket":        bucket,
@@ -1304,7 +1676,13 @@ def tick(signals: dict, focus_map: dict | None = None) -> tuple[list[dict], list
     so they feed the new buckets without overwriting manual GUI sliders.
     focus_map: optional {bucket: focus_string} to ground this tick's actions.
     """
-    global _pressure, _tick_count
+    global _pressure, _tick_count, _speech_remaining_ticks, _settling_pressure
+
+    if _speech_remaining_ticks > 0:
+        _speech_remaining_ticks -= 1
+
+    if _settling_pressure > 0.0:
+        _settling_pressure = max(0.0, _settling_pressure - 0.2)
 
     # merge analyzer overrides (they only affect their own signal names)
     merged_signals = dict(signals)
@@ -1312,11 +1690,77 @@ def tick(signals: dict, focus_map: dict | None = None) -> tuple[list[dict], list
         merged_signals[k] = v   # analyzer wins for its own keys
 
     _tick_count += 1
+    presence_strength = visual_presence_strength(merged_signals)
+    if presence_strength > 0.0:
+        merged_signals["time_since_interaction"] = min(
+            float(merged_signals.get("time_since_interaction", 0.0) or 0.0),
+            1.0 - presence_strength,
+        )
     after_a            = _phase_a(merged_signals)
     after_b, _, eflows = _phase_b(after_a)
+    if presence_strength > 0.0:
+        after_b = {
+            name: round(
+                max(0.0, value * (1.0 - ((1.0 - VISUAL_PRESENCE_RELIEF.get(name, 1.0)) * presence_strength))),
+                4,
+            )
+            for name, value in after_b.items()
+        }
+    after_b            = _apply_active_conversation_settling(after_b)
     after_c, fired_log = _phase_c(after_b, merged_signals, focus_map)
     _pressure = after_c
+    memory_field.tick(_pressure, _tick_count)
+    memory_field.project_to_knowledge_graph(graph)
+
+    # auto-save every 5 ticks
+    if _tick_count % 5 == 0:
+        save_state()
+
     return fired_log, eflows
+
+
+def charge_only_tick(signals: dict) -> list[float]:
+    """
+    Advance pressure without dispatching actions.
+    Used by UI-only charge paths so they share conversation suppression rules.
+    """
+    global _pressure, _tick_count, _speech_remaining_ticks, _settling_pressure
+
+    if _speech_remaining_ticks > 0:
+        _speech_remaining_ticks -= 1
+
+    if _settling_pressure > 0.0:
+        _settling_pressure = max(0.0, _settling_pressure - 0.2)
+
+    merged_signals = dict(signals)
+    for k, v in _analyzer_signals.items():
+        merged_signals[k] = v
+
+    _tick_count += 1
+    presence_strength = visual_presence_strength(merged_signals)
+    if presence_strength > 0.0:
+        merged_signals["time_since_interaction"] = min(
+            float(merged_signals.get("time_since_interaction", 0.0) or 0.0),
+            1.0 - presence_strength,
+        )
+    after_a = _phase_a(merged_signals)
+    after_b, _, eflows = _phase_b(after_a)
+    if presence_strength > 0.0:
+        after_b = {
+            name: round(
+                max(0.0, value * (1.0 - ((1.0 - VISUAL_PRESENCE_RELIEF.get(name, 1.0)) * presence_strength))),
+                4,
+            )
+            for name, value in after_b.items()
+        }
+    _pressure = _apply_active_conversation_settling(after_b)
+    memory_field.tick(_pressure, _tick_count)
+    memory_field.project_to_knowledge_graph(graph)
+
+    if _tick_count % 5 == 0:
+        save_state()
+
+    return eflows
 
 
 # =============================================================================

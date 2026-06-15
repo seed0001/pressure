@@ -4,3 +4,8 @@ __pycache__/
 *.log
 .claude/
 .DS_Store
+certs/
+data/
+*.wav
+*.mp3
+

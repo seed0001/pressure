@@ -210,7 +210,7 @@ def do_tick(user_spoke: bool, user_text: str = ""):
 
     direct_reply_sent = False
     if user_spoke and user_text:
-        reply = pe.handle_passive_response(dict(signals), user_text)
+        reply = pe.handle_passive_response(dict(signals), user_text, focus_subject=focus_subject)
         if reply:
             print_agent_message(reply)
             pe.push_chat_history("assistant", reply)
@@ -332,7 +332,7 @@ Type /help for commands.
 
         # let the agent "hear" what was said by routing it as a user message
         # and noting it as a low-level focus update
-        pe.push_chat_history("user", raw, analyze=False)
+        pe.push_chat_history("user", raw, analyze=True)
         if len(raw) > 10:
             # use the message as focus context if it looks substantive
             pass   # perception layer (Layer 4) will do this properly

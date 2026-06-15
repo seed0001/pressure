@@ -82,7 +82,7 @@ class Edge:
             "source": self.source_id, "target": self.target_id,
             "relation": self.relation, "weight": round(self.weight, 3),
             "confidence": round(self.confidence, 3),
-            "tick": self.tick, "source": self.source,
+            "tick": self.tick, "provenance": self.source,
         }
 
 
@@ -292,5 +292,6 @@ def extract_from_text(text: str, call_model_fn, tick: int = 0,
         # strip markdown fences if model wraps in ```json ... ```
         raw = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`").strip()
         return json.loads(raw)
-    except Exception:
+    except Exception as e:
+        print(f"[extract_from_text] Error: {e}")
         return {"nodes": [], "edges": []}

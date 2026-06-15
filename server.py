@@ -1,8 +1,18 @@
 """
 Household Agent — GUI Server
 Run:  python server.py
-Then open:  http://localhost:7437
+Then open:  https://localhost:7437
 """
+
+import sys
+import os
+import subprocess
+
+# Auto-redirect to virtual environment if running outside it
+VENV_PYTHON = os.path.normpath(r"c:\users\aztre\appdata\local\hermes\hermes-agent\venv\Scripts\python.exe")
+if os.path.exists(VENV_PYTHON) and os.path.normpath(sys.executable).lower() != VENV_PYTHON.lower():
+    res = subprocess.run([VENV_PYTHON] + sys.argv)
+    sys.exit(res.returncode)
 
 import json
 import threading
@@ -12,12 +22,14 @@ import urllib.request
 import urllib.parse
 import argparse
 import socket
+import ssl
 import os
 import shutil
 import subprocess
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 import pressure_engine as pe
 import primitive_concept_engine as pc_module
+import vision_sensor
 
 # ── shared state ──────────────────────────────────────────────────────────────
 _lock = threading.Lock()
@@ -32,9 +44,17 @@ signals = {
 }
 
 focus_subject   = "general household needs"
+local_camera_allowed = True
 tick_count      = 0
 chat_messages   = []   # [{role, text, tick}]
 edge_totals     = [0.0] * len(pe.CONFIG["edges"])
+
+
+def _apply_presence_to_server_signals() -> float:
+    strength = pe.visual_presence_strength(signals)
+    if strength > 0.0:
+        signals["time_since_interaction"] = 0.0
+    return strength
 
 STRESS_WORDS = {"stressed","overwhelmed","tired","exhausted","busy","worried","anxious",
                 "behind","late","deadline","hard","struggling","too much","frustrated",
@@ -52,14 +72,16 @@ def _do_tick(user_spoke=False, user_text=""):
     with _lock:
         tick_count += 1
         current_tick = tick_count
+        signals.update(vision_sensor.get_current_state())
+        _apply_presence_to_server_signals()
         if user_spoke and user_text:
             signals["user_stress"] = _infer_stress(user_text)
-            pe.push_chat_history("user", user_text, analyze=False)
+            pe.push_chat_history("user", user_text, analyze=True, signals=dict(signals))
         signal_snapshot = dict(signals)
         focus_map = {n: focus_subject for n in pe.CONFIG["buckets"]}
 
     if user_spoke and user_text:
-        reply = pe.handle_passive_response(signal_snapshot, user_text)
+        reply = pe.handle_passive_response(signal_snapshot, user_text, focus_subject=focus_subject)
         if reply:
             with _lock:
                 chat_messages.append({
@@ -69,7 +91,9 @@ def _do_tick(user_spoke=False, user_text=""):
                     "bucket": None,
                     "action": "chat",
                 })
-                pe.push_chat_history("assistant", reply)
+                pe.push_chat_history("assistant", reply, signals=dict(signals))
+                read_ticks = max(2, len(reply) // 250)
+                pe.add_contract("user_reading", read_ticks, confidence=1.0)
                 direct_reply_sent = True
 
     with _engine_lock:
@@ -79,6 +103,8 @@ def _do_tick(user_spoke=False, user_text=""):
         for i, ef in enumerate(eflows):
             edge_totals[i] += ef
         if user_spoke:
+            signals["time_since_interaction"] = 0.0
+        elif pe.visual_presence_strength(signals) > 0.0:
             signals["time_since_interaction"] = 0.0
         else:
             signals["time_since_interaction"] = round(
@@ -126,7 +152,9 @@ def _do_tick(user_spoke=False, user_text=""):
                         "action": atype,
                     })
                     visible_reply_sent = True
-                    pe.push_chat_history("assistant", msg)
+                    pe.push_chat_history("assistant", msg, signals=dict(signals))
+                    read_ticks = max(2, len(msg) // 250)
+                    pe.add_contract("user_reading", read_ticks, confidence=1.0)
 
         # Fallback for non-chat callers; normal user chat replies before pressure work.
         if user_spoke and user_text and not direct_reply_sent:
@@ -139,7 +167,7 @@ def _do_tick(user_spoke=False, user_text=""):
                     "bucket": None,
                     "action": "passive",
                 })
-                pe.push_chat_history("assistant", reply)
+                pe.push_chat_history("assistant", reply, signals=dict(signals))
 
         return fired_log, eflows
 
@@ -148,13 +176,16 @@ def _do_charge_tick():
     global tick_count
     with _lock:
         tick_count += 1
-        after_a = pe._phase_a(dict(signals))
-        after_b, _, eflows = pe._phase_b(after_a)
-        pe._pressure = after_b
+        signals.update(vision_sensor.get_current_state())
+        _apply_presence_to_server_signals()
+        eflows = pe.charge_only_tick(dict(signals))
         for i, ef in enumerate(eflows):
             edge_totals[i] += ef
-        signals["time_since_interaction"] = round(
-            min(1.0, signals["time_since_interaction"] + 0.05), 3)
+        if pe.visual_presence_strength(signals) > 0.0:
+            signals["time_since_interaction"] = 0.0
+        else:
+            signals["time_since_interaction"] = round(
+                min(1.0, signals["time_since_interaction"] + 0.05), 3)
         return eflows
 
 def _do_reset():
@@ -169,6 +200,20 @@ def _do_reset():
             "open_task_load":0.40,"knowledge_gap":0.30,
             "time_since_contribution":0.00,
         })
+
+def _do_clear_memory():
+    global tick_count, edge_totals
+    with _lock:
+        pe.clear_memory()
+        tick_count  = 0
+        edge_totals = [0.0] * len(pe.CONFIG["edges"])
+        chat_messages.clear()
+        signals.update({
+            "user_stress":0.10,"time_since_interaction":0.00,
+            "open_task_load":0.40,"knowledge_gap":0.30,
+            "time_since_contribution":0.00,
+        })
+
 
 def _fetch_ollama_models():
     try:
@@ -221,10 +266,11 @@ def _speak_edge_tts(text):
     text = (text or "").strip()
     if not text:
         raise ValueError("No text to speak")
-    text = text[:1200]
+    text = text[:5000]
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "edge_tts_speak.js")
+    voice = pe.CONFIG.get("TTS_VOICE", "en-IE-EmilyNeural")
     result = subprocess.run(
-        [_node_executable(), script, text],
+        [_node_executable(), script, text, voice],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=os.path.dirname(os.path.abspath(__file__)),
@@ -298,6 +344,7 @@ class Handler(BaseHTTPRequestHandler):
                 "pressures":  pressures,
                 "thresholds": thresholds,
                 "signals":    signals,
+                "vision":     vision_sensor.get_status(),
                 "journal":    journal,
                 "outbox":     outbox,
                 "knowledge":  ks,
@@ -310,6 +357,7 @@ class Handler(BaseHTTPRequestHandler):
                 "model_status": pe.get_model_status(),
                 "graph_summary": pe.graph.summary_text(max_nodes=12),
                 "graph_counts": {"nodes": len(pe.graph.nodes), "edges": len(pe.graph.edges)},
+                "memory_field": pe.get_memory_field(),
                 "messages":   chat_messages[-60:],
                 "edge_totals": edge_totals,
                 "edges": [[s,t,w,d,str(w/d)[:4]] for s,t,w,d in pe.CONFIG["edges"]],
@@ -322,6 +370,7 @@ class Handler(BaseHTTPRequestHandler):
                     "cooldowns":pe.CONFIG["cooldowns"],
                     "budget":   pe.CONFIG["ACTION_BUDGET"],
                     "window":   pe.CONFIG["BUDGET_WINDOW"],
+                    "voice":    pe.CONFIG.get("TTS_VOICE", "en-IE-EmilyNeural"),
                 },
             })
             return
@@ -331,10 +380,28 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/graph":
             self._json(pe.graph.to_dict())
             return
+        if path == "/api/memory_field":
+            self._json(pe.get_memory_field())
+            return
+        if path == "/api/camera_feed":
+            img_bytes = vision_sensor.get_latest_frame()
+            if img_bytes:
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", len(img_bytes))
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(img_bytes)
+            else:
+                self.send_response(404)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+            return
         self._json({"error": "not found"}, 404)
 
     def do_POST(self):
-        global focus_subject, tick_count
+        global focus_subject, tick_count, local_camera_allowed
         length  = int(self.headers.get("Content-Length", 0))
         body    = json.loads(self.rfile.read(length) or b"{}")
         path    = self.path
@@ -348,10 +415,12 @@ class Handler(BaseHTTPRequestHandler):
                     chat_messages.append({"role": "user", "text": text, "tick": current_tick})
                     signals["user_stress"] = _infer_stress(text)
                     signals["time_since_interaction"] = 0.0
-                    pe.push_chat_history("user", text, analyze=False)
+                    signals.update(vision_sensor.get_current_state())
+                    _apply_presence_to_server_signals()
+                    pe.push_chat_history("user", text, analyze=True, signals=dict(signals))
                     reply_signals = dict(signals)
                 try:
-                    reply = pe.handle_passive_response(reply_signals, text)
+                    reply = pe.handle_passive_response(reply_signals, text, focus_subject=focus_subject)
                 except Exception as exc:
                     reply = f"I'm trying to answer, but the model call failed: {type(exc).__name__}: {exc}"
                 if reply:
@@ -363,7 +432,10 @@ class Handler(BaseHTTPRequestHandler):
                             "bucket": None,
                             "action": "chat",
                         })
-                        pe.push_chat_history("assistant", reply)
+                        pe.push_chat_history("assistant", reply, signals=dict(signals))
+                        read_ticks = max(2, len(reply) // 250)
+                        pe.add_contract("user_reading", read_ticks, confidence=1.0)
+                        pe.save_state()
             self._json({"ok": True, "tick": tick_count})
             return
 
@@ -387,6 +459,7 @@ class Handler(BaseHTTPRequestHandler):
                 if "focus"    in body: focus_subject                 = body["focus"]
                 if "release"  in body: pe.CONFIG["RELEASE_FRACTION"] = float(body["release"])
                 if "flow_rate"in body: pe.CONFIG["FLOW_RATE"]        = float(body["flow_rate"])
+                if "voice"    in body: pe.CONFIG["TTS_VOICE"]        = body["voice"]
             self._json({"ok": True})
             return
 
@@ -400,6 +473,64 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/reset":
             _do_reset()
             self._json({"ok": True})
+            return
+
+        if path == "/api/clear_memory":
+            _do_clear_memory()
+            self._json({"ok": True})
+            return
+
+
+        if path == "/api/toggle_cam":
+            if not local_camera_allowed:
+                vision_sensor.set_idle("none", "")
+                status = vision_sensor.get_status()
+                self._json({
+                    "enabled": False,
+                    "status": status,
+                    "message": "Server-local camera is disabled by default; use Browser Webcam from the user's device."
+                })
+                return
+            if vision_sensor._running:
+                vision_sensor.stop()
+                status = vision_sensor.get_status()
+            else:
+                vision_sensor.start()
+                time.sleep(0.25)
+                status = vision_sensor.get_status()
+            self._json({"enabled": bool(status.get("running")), "status": status})
+            return
+        if path == "/api/vision_state":
+            try:
+                vision_sensor.update_state(body)
+                with _lock:
+                    signals.update(vision_sensor.get_current_state())
+                self._json({"ok": True})
+            except Exception as exc:
+                self._json({"error": f"{type(exc).__name__}: {exc}"}, 400)
+            return
+
+        if path == "/api/vision_frame":
+            try:
+                img_data = body.get("image", "")
+                if "," in img_data:
+                    img_data = img_data.split(",")[1]
+                import base64
+                import numpy as np
+                import cv2
+                img_bytes = base64.b64decode(img_data)
+                nparr = np.frombuffer(img_bytes, np.uint8)
+                frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                if frame is not None:
+                    new_state = vision_sensor.process_frame(frame)
+                    with _lock:
+                        signals.update(new_state)
+                        _apply_presence_to_server_signals()
+                    self._json({"ok": True, "state": new_state})
+                else:
+                    self._json({"error": "Failed to decode frame"}, 400)
+            except Exception as exc:
+                self._json({"error": f"{type(exc).__name__}: {exc}"}, 400)
             return
 
         self._json({"error": "not found"}, 404)
@@ -481,6 +612,8 @@ HTML = r"""<!DOCTYPE html>
   .msg-meta{font-size:11px;margin-top:4px;opacity:.6}
   .msg-agent .msg-meta{color:var(--text3)}
   .msg-agent .msg-bucket{display:inline-block;font-size:10px;padding:1px 6px;border-radius:3px;margin-bottom:5px;font-weight:600}
+  .msg-play-btn{background:transparent;border:none;color:inherit;cursor:pointer;font-size:11px;padding:2px 6px;margin-left:8px;opacity:.5;transition:opacity .2s,transform .2s;display:inline-flex;align-items:center;justify-content:center;border-radius:4px}
+  .msg-play-btn:hover{opacity:1;transform:scale(1.15);background:rgba(255,255,255,0.1)}
   #input-row{display:flex;gap:8px;padding:12px;border-top:1px solid var(--border);flex-shrink:0}
   #chat-input{flex:1;background:var(--bg3);border:1px solid var(--border2);color:var(--text);border-radius:var(--radius-sm);padding:8px 12px;font-size:14px;outline:none;resize:none;height:40px}
   #chat-input:focus{border-color:var(--blue)}
@@ -546,14 +679,24 @@ HTML = r"""<!DOCTYPE html>
   <span id="model-status" style="font-size:11px;color:var(--text3)">model idle</span>
   <span id="tick-display">tick 0</span>
   <div class="spacer"></div>
-  <span class="badge" style="background:#1a2530;color:var(--blue);border:1px solid #294360">Andrew</span>
+  <select id="voice-select" style="width:140px;background:var(--bg3);color:var(--text1);border:1px solid var(--border1);border-radius:6px;padding:4px;margin-right:8px;" onchange="setVoice(this.value)">
+    <option value="en-IE-EmilyNeural">Emily (Female)</option>
+    <option value="en-US-AndrewNeural">Andrew (Male)</option>
+    <option value="en-US-EmmaNeural">Emma (Female)</option>
+    <option value="en-US-AvaNeural">Ava (Female)</option>
+    <option value="en-GB-SoniaNeural">Sonia (UK Female)</option>
+    <option value="en-GB-RyanNeural">Ryan (UK Male)</option>
+  </select>
   <button onclick="toggleVoice()" id="voice-btn" title="Speak agent replies with Edge TTS">Voice on</button>
+  <button onclick="toggleBrowserCam()" id="cam-btn" title="Use this browser device camera">Browser cam</button>
   <select id="model-select" style="width:200px" onchange="setModel(this.value)">
     <option value="">Loading models…</option>
   </select>
   <button onclick="toggleDryRun()" id="dry-btn">Enable dry run</button>
+  <button class="danger" onclick="doClearMemory()" title="Clear semantic knowledge graph and episodic memory">Clear Memory</button>
   <button class="danger" onclick="doReset()">Reset</button>
 </div>
+
 
 <div id="layout">
 
@@ -626,6 +769,30 @@ HTML = r"""<!DOCTYPE html>
       <div style="font-size:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text3);margin-bottom:8px">Focus subject</div>
       <input type="text" id="focus-input" value="general household needs" style="width:100%;margin-bottom:6px" placeholder="what the agent is thinking about…">
       <button onclick="setFocus()" style="width:100%">Update focus</button>
+
+      <div style="border-top:1px solid var(--border);margin:14px 0 12px"></div>
+      <div style="font-size:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text3);margin-bottom:8px">Browser Webcam</div>
+      <div id="browser-cam-card" style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:10px;margin-bottom:10px">
+        <div style="position:relative;width:100%;padding-top:75%;background:#000;border-radius:var(--radius-sm);overflow:hidden;margin-bottom:8px">
+          <video id="browser-cam-video" autoplay playsinline muted style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1);display:none;"></video>
+          <img id="browser-cam-feed" src="/api/camera_feed" style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1);display:none;">
+          <div id="browser-cam-placeholder" style="position:absolute;top:0;left:0;width:100%;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;color:var(--text3);font-size:12px;padding:12px;text-align:center;background:#000;">
+            <span id="browser-cam-placeholder-title" style="font-weight:bold;margin-bottom:6px;">Camera Off</span>
+            <span id="browser-cam-help-text" style="font-size:10px;color:var(--text2);display:none;line-height:1.3;">Webcam requires HTTPS or Localhost.<br>To test on LAN, open Chrome/Edge flags:<br><code style="color:var(--blue);word-break:break-all;font-size:9px;">chrome://flags/#unsafely-treat-insecure-origin-as-secure</code><br>add this origin, enable, and relaunch.</span>
+          </div>
+        </div>
+        <div style="display:flex;gap:6px;margin-bottom:6px">
+          <button id="browser-cam-btn" onclick="toggleBrowserCam()" style="width:100%" class="primary">Start Browser Cam</button>
+        </div>
+        <div style="font-size:11px;color:var(--text3);display:flex;flex-direction:column;gap:4px">
+          <div style="display:flex;justify-content:space-between"><span>Status:</span><span id="browser-cam-status" style="font-weight:600">Inactive</span></div>
+          <div style="display:flex;justify-content:space-between"><span>Source:</span><span id="browser-cam-source">-</span></div>
+          <div style="display:flex;justify-content:space-between"><span>Light:</span><span id="browser-cam-light">-</span></div>
+          <div style="display:flex;justify-content:space-between"><span>Faces:</span><span id="browser-cam-faces">-</span></div>
+          <div style="display:flex;justify-content:space-between"><span>Motion:</span><span id="browser-cam-motion">-</span></div>
+          <div style="display:flex;justify-content:space-between"><span>Attention:</span><span id="browser-cam-attention">-</span></div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -740,17 +907,17 @@ HTML = r"""<!DOCTYPE html>
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
         <span style="font-size:12px;color:var(--text3)">Sub-cognitive concept formation. No LLM.</span>
       </div>
-      
+
       <div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Concept Pressure</div>
       <div style="height:6px;background:var(--bg3);border-radius:3px;margin-bottom:14px;overflow:hidden">
         <div id="prim-pressure-fill" style="height:100%;background:var(--coral);width:0%;transition:width .4s"></div>
       </div>
-      
+
       <div style="font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text3);margin-bottom:6px">Tentative Concepts (<span id="prim-tentative-count">0</span>)</div>
       <div id="prim-tentatives" style="margin-bottom:14px">
         <div style="color:var(--text3);font-size:12px">None yet.</div>
       </div>
-      
+
       <div style="font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text3);margin-bottom:6px">Active Patterns</div>
       <div id="prim-patterns" style="margin-bottom:14px">
         <div style="color:var(--text3);font-size:12px">None yet.</div>
@@ -825,8 +992,8 @@ function toggleVoice(){
   if(btn) btn.textContent=voiceEnabled?'Voice on':'Voice off';
 }
 
-async function speakText(text){
-  if(!voiceEnabled || !text) return;
+async function speakText(text, force = false){
+  if((!force && !voiceEnabled) || !text) return;
   try{
     const r=await fetch('/api/tts',{
       method:'POST',
@@ -853,19 +1020,21 @@ async function speakText(text){
   }
 }
 
-async function loadModels(){
+async function loadModels(activeModel){
   const data=await api('/api/models');
   const sel=document.getElementById('model-select');
+  if(!sel) return;
   sel.innerHTML='';
   (data.models||[]).forEach(m=>{
     const o=document.createElement('option');
     o.value=m; o.textContent=m;
-    if(m==='llama3.2:latest') o.selected=true;
+    if(activeModel && m===activeModel) o.selected=true;
     sel.appendChild(o);
   });
 }
 
 function setModel(v){postConfig({model:v})}
+function setVoice(v){postConfig({voice:v})}
 
 function toggleDryRun(){
   dryRun=!dryRun;
@@ -918,6 +1087,18 @@ async function doReset(){
   await refresh();
 }
 
+async function doClearMemory(){
+  if (!confirm("Are you sure you want to clear all semantic graph and episodic dialogue memory? This cannot be undone.")) return;
+  await api('/api/clear_memory',{});
+  spokenMessageKeys.clear();
+  if(currentAudio) currentAudio.pause();
+  document.getElementById('messages').innerHTML=
+    '<div class="msg msg-system">Memory cleared. Knowledge graph and episodic dialogue wiped.</div>';
+  lastMsgSignature='';
+  await refresh();
+}
+
+
 function msgKey(m){
   return [m.role,m.tick||0,m.action||'',m.text||''].join('|');
 }
@@ -927,14 +1108,14 @@ function appendMsg(m, allowSpeech=true){
   const div=document.createElement('div');
   if(m.role==='user'){
     div.className='msg msg-user';
-    div.textContent=m.text;
+    div.innerHTML=`<span class="msg-txt">${escHtml(m.text)}</span><button class="msg-play-btn" onclick="speakText(decodeURIComponent('${encodeURIComponent(m.text)}'), true)" title="Play message">▶</button>`;
   } else if(m.role==='agent'){
     div.className='msg msg-agent';
     const color=BUCKET_COLORS[m.bucket]||'var(--text2)';
-    div.innerHTML=`<div class="msg-bucket" style="background:${color}22;color:${color}">${m.bucket||'agent'} / ${m.action||''}</div>${escHtml(m.text)}<div class="msg-meta">tick ${m.tick||0}</div>`;
+    div.innerHTML=`<div class="msg-bucket" style="background:${color}22;color:${color}">${m.bucket||'agent'} / ${m.action||''}</div><span class="msg-txt">${escHtml(m.text)}</span><button class="msg-play-btn" onclick="speakText(decodeURIComponent('${encodeURIComponent(m.text)}'), true)" title="Play message">▶</button><div class="msg-meta">tick ${m.tick||0}</div>`;
   } else if(m.role==='thought'){
     div.className='msg msg-thought';
-    div.innerHTML=`<div class="msg-meta">thought · tick ${m.tick||0}</div>${escHtml(m.text)}`;
+    div.innerHTML=`<div class="msg-meta">thought · tick ${m.tick||0}</div><span class="msg-txt">${escHtml(m.text)}</span><button class="msg-play-btn" onclick="speakText(decodeURIComponent('${encodeURIComponent(m.text)}'), true)" title="Play thought">▶</button>`;
   } else {
     div.className='msg msg-system';
     div.textContent=m.text;
@@ -969,6 +1150,8 @@ async function refresh(){
   document.getElementById('mode-badge').textContent=dryRun?'DRY RUN':'LIVE';
   const sel=document.getElementById('model-select');
   if(sel && state.config.model && sel.value!==state.config.model) sel.value=state.config.model;
+  const vsel=document.getElementById('voice-select');
+  if(vsel && state.config.voice && vsel.value!==state.config.voice) vsel.value=state.config.voice;
   const ms=state.model_status||{};
   const msEl=document.getElementById('model-status');
   if(msEl){
@@ -982,6 +1165,39 @@ async function refresh(){
       msEl.textContent='model idle';
       msEl.style.color='var(--text3)';
     }
+  }
+
+  const vision = state.vision || {};
+  const camBtn = document.getElementById('cam-btn');
+  if(camBtn){
+    camBtn.textContent = browserCamStream ? 'Browser cam on' : 'Browser cam';
+    camBtn.style.color = browserCamStream ? '' : 'var(--text1)';
+    camBtn.title = 'Use this browser device camera';
+  }
+  if(!browserCamStream){
+    const statusEl = document.getElementById('browser-cam-status');
+    if(statusEl){
+      if(vision.camera_error){
+        statusEl.textContent = vision.camera_error;
+        statusEl.style.color = 'var(--red)';
+      } else if(vision.has_frame){
+        statusEl.textContent = `${vision.camera_source || 'camera'} frame ${vision.frame_age_seconds ?? '?'}s`;
+        statusEl.style.color = 'var(--green)';
+      } else {
+        statusEl.textContent = 'No frame';
+        statusEl.style.color = 'var(--text3)';
+      }
+    }
+    const faces = document.getElementById('browser-cam-faces');
+    const source = document.getElementById('browser-cam-source');
+    const light = document.getElementById('browser-cam-light');
+    const motion = document.getElementById('browser-cam-motion');
+    const attention = document.getElementById('browser-cam-attention');
+    if(source) source.textContent = vision.camera_source || '-';
+    if(light) light.textContent = Number(vision.brightness_level || 0).toFixed(2);
+    if(faces) faces.textContent = vision.face_count ?? '-';
+    if(motion) motion.textContent = Number(vision.motion_level || 0).toFixed(2);
+    if(attention) attention.textContent = vision.attention_detected ? 'Yes' : 'No';
   }
 
   // buckets
@@ -1084,7 +1300,7 @@ async function refresh(){
   if(state.primitive){
     document.getElementById('prim-pressure-fill').style.width = (state.primitive.concept_pressure * 100) + '%';
     document.getElementById('prim-tentative-count').textContent = state.primitive.tentative_count;
-    
+
     const tentEl = document.getElementById('prim-tentatives');
     if(tentEl){
         if(state.primitive.tentative_concepts.length === 0){
@@ -1259,7 +1475,7 @@ function renderNodeList(data){
 
 function switchTab(name){
   document.querySelectorAll('.tab').forEach((t,i)=>{
-    const names=['journal','graph','knowledge','analyzer','config'];
+    const names=['journal','graph','knowledge','analyzer','primitive','config'];
     t.classList.toggle('active',names[i]===name);
   });
   document.querySelectorAll('.tab-content').forEach(c=>{
@@ -1284,8 +1500,172 @@ setInterval(async()=>{
 // poll for state every second
 setInterval(()=>{ refresh(); },1000);
 
-loadModels();
-refresh();
+let browserCamStream = null;
+let browserCamInterval = null;
+let feedInterval = null;
+
+function setBrowserCamPlaceholder(titleText, helpVisible=false) {
+  const placeholder = document.getElementById('browser-cam-placeholder');
+  const title = document.getElementById('browser-cam-placeholder-title');
+  const help = document.getElementById('browser-cam-help-text');
+  if (placeholder) placeholder.style.display = 'flex';
+  if (title) title.textContent = titleText;
+  if (help) help.style.display = helpVisible ? 'block' : 'none';
+}
+
+function setupFeedRefresh() {
+  const img = document.getElementById('browser-cam-feed');
+  const placeholder = document.getElementById('browser-cam-placeholder');
+  if (!img) return;
+
+  img.onload = () => {
+    if (browserCamStream) return;
+    img.style.display = 'block';
+    if (placeholder) placeholder.style.display = 'none';
+  };
+
+  img.onerror = () => {
+    if (browserCamStream) return;
+    img.style.display = 'none';
+    setBrowserCamPlaceholder('Camera Off');
+  };
+
+  if (!feedInterval) {
+    feedInterval = setInterval(() => {
+      if (browserCamStream) return;
+      img.src = '/api/camera_feed?t=' + Date.now();
+    }, 500);
+  }
+}
+
+async function toggleBrowserCam() {
+  const btn = document.getElementById('browser-cam-btn');
+  const topBtn = document.getElementById('cam-btn');
+  const video = document.getElementById('browser-cam-video');
+  const feedImg = document.getElementById('browser-cam-feed');
+  const placeholder = document.getElementById('browser-cam-placeholder');
+  const statusEl = document.getElementById('browser-cam-status');
+
+  if (browserCamStream) {
+    stopBrowserCam();
+    return;
+  }
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    statusEl.textContent = 'Insecure Context';
+    showStatus('browser camera requires HTTPS, localhost, or a trusted insecure-origin browser setting', true);
+    setBrowserCamPlaceholder('Secure Context Required', true);
+    if (feedImg) feedImg.style.display = 'none';
+    stopBrowserCam();
+    return;
+  }
+
+  statusEl.textContent = 'Requesting access...';
+  try {
+    browserCamStream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 320 }, height: { ideal: 240 } }
+    });
+    video.srcObject = browserCamStream;
+    video.style.display = 'block';
+    if (feedImg) feedImg.style.display = 'none';
+    placeholder.style.display = 'none';
+    btn.textContent = 'Stop Browser Cam';
+    btn.classList.add('danger');
+    btn.classList.remove('primary');
+    if (topBtn) topBtn.textContent = 'Browser cam on';
+    statusEl.textContent = 'Active';
+
+    const canvas = document.createElement('canvas');
+    canvas.width = 160;
+    canvas.height = 120;
+    const ctx = canvas.getContext('2d');
+
+    browserCamInterval = setInterval(async () => {
+      if (!browserCamStream) return;
+      try {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.6);
+        const res = await api('/api/vision_frame', { image: dataUrl });
+        if (res && res.state) {
+          document.getElementById('browser-cam-faces').textContent = res.state.face_count;
+          const srcEl = document.getElementById('browser-cam-source');
+          const lightEl = document.getElementById('browser-cam-light');
+          if(srcEl) srcEl.textContent = res.state.camera_source || 'browser';
+          if(lightEl) lightEl.textContent = Number(res.state.brightness_level || 0).toFixed(2);
+          document.getElementById('browser-cam-motion').textContent = res.state.motion_level.toFixed(2);
+          document.getElementById('browser-cam-attention').textContent = res.state.attention_detected ? 'Yes' : 'No';
+          statusEl.textContent = 'Streaming';
+        }
+      } catch (e) {
+        console.error('Failed to send vision frame:', e);
+        statusEl.textContent = 'Error';
+      }
+    }, 250);
+  } catch (err) {
+    console.error('Camera access failed:', err);
+    statusEl.textContent = 'Failed';
+    setBrowserCamPlaceholder(err && err.name === 'NotAllowedError' ? 'Access Denied' : 'Camera Failed');
+    stopBrowserCam();
+  }
+}
+
+function stopBrowserCam() {
+  const btn = document.getElementById('browser-cam-btn');
+  const video = document.getElementById('browser-cam-video');
+  const feedImg = document.getElementById('browser-cam-feed');
+  const placeholder = document.getElementById('browser-cam-placeholder');
+  const statusEl = document.getElementById('browser-cam-status');
+
+  if (browserCamInterval) {
+    clearInterval(browserCamInterval);
+    browserCamInterval = null;
+  }
+  if (browserCamStream) {
+    browserCamStream.getTracks().forEach(track => track.stop());
+    browserCamStream = null;
+  }
+  if (video) {
+    video.srcObject = null;
+    video.style.display = 'none';
+  }
+  if (feedImg) {
+    feedImg.src = '/api/camera_feed?t=' + Date.now();
+  }
+  if (placeholder) {
+    placeholder.style.display = 'flex';
+    if (statusEl && statusEl.textContent !== 'Insecure Context') {
+      setBrowserCamPlaceholder('Camera Off');
+    }
+  }
+  if (btn) {
+    btn.textContent = 'Start Browser Cam';
+    btn.classList.remove('danger');
+    btn.classList.add('primary');
+  }
+  const topBtn = document.getElementById('cam-btn');
+  if (topBtn) topBtn.textContent = 'Browser cam';
+  if (statusEl) statusEl.textContent = 'Inactive';
+
+  const faces = document.getElementById('browser-cam-faces');
+  const source = document.getElementById('browser-cam-source');
+  const light = document.getElementById('browser-cam-light');
+  const motion = document.getElementById('browser-cam-motion');
+  const attention = document.getElementById('browser-cam-attention');
+  if (source) source.textContent = '-';
+  if (light) light.textContent = '-';
+  if (faces) faces.textContent = '-';
+  if (motion) motion.textContent = '-';
+  if (attention) attention.textContent = '-';
+}
+
+async function init() {
+  const state = await api('/api/state');
+  const activeModel = (state && state.config) ? state.config.model : null;
+  await loadModels(activeModel);
+  await refresh();
+  setupFeedRefresh();
+}
+init();
 </script>
 </body>
 </html>
@@ -1309,20 +1689,23 @@ MOBILE_HTML = r"""<!DOCTYPE html>
   }
   *{box-sizing:border-box;margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
   body{background:var(--bg);color:var(--text);height:100vh;height:100dvh;display:flex;flex-direction:column;overflow:hidden}
-  
+
   #topbar{display:flex;align-items:center;justify-content:space-between;padding:12px;border-bottom:1px solid var(--border);background:var(--bg2);flex-shrink:0}
   #topbar h1{font-size:16px;font-weight:600;letter-spacing:.02em}
   .voice-btn{background:var(--bg3);border:1px solid var(--border2);color:var(--text2);border-radius:12px;padding:4px 10px;font-size:12px;cursor:pointer}
   .voice-btn.active{background:var(--blue2);color:#fff;border-color:var(--blue)}
-  
+
   #messages{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px}
   #messages::-webkit-scrollbar{width:0px;background:transparent;} /* Hide scrollbar for mobile */
-  
+
   .msg{max-width:88%;padding:12px 14px;border-radius:var(--radius);font-size:15px;line-height:1.4}
   .msg-user{align-self:flex-end;background:var(--blue2);color:#fff;border-radius:var(--radius) var(--radius) 4px var(--radius)}
   .msg-agent{align-self:flex-start;background:var(--bg3);border:1px solid var(--border2)}
   .msg-thought{align-self:flex-start;background:#201d2a;border:1px dashed var(--purple);color:var(--text2);font-style:italic;font-size:14px}
-  
+  .msg-play-btn{background:transparent;border:none;color:inherit;cursor:pointer;font-size:12px;padding:2px 6px;margin-left:8px;opacity:.5;transition:opacity .2s,transform .2s;display:inline-flex;align-items:center;justify-content:center;border-radius:4px}
+  .msg-play-btn:hover{opacity:1;transform:scale(1.15);background:rgba(255,255,255,0.1)}
+
+
   #input-area{padding:12px;background:var(--bg2);border-top:1px solid var(--border);flex-shrink:0;padding-bottom:calc(12px + env(safe-area-inset-bottom));}
   .input-wrapper{display:flex;gap:8px;align-items:flex-end}
   textarea{flex:1;background:var(--bg3);border:1px solid var(--border2);color:var(--text);border-radius:20px;padding:10px 14px;font-size:16px;outline:none;resize:none;max-height:100px;min-height:42px;line-height:1.4}
@@ -1335,7 +1718,24 @@ MOBILE_HTML = r"""<!DOCTYPE html>
 
 <div id="topbar">
   <h1>Household Agent</h1>
-  <button id="mobile-voice-btn" class="voice-btn active" onclick="toggleVoice()">Voice on</button>
+  <div style="display:flex;gap:6px;align-items:center">
+    <select id="mobile-model-select" style="max-width:110px;background:var(--bg3);color:var(--text);border:1px solid var(--border2);border-radius:12px;padding:4px 8px;font-size:12px;outline:none;" onchange="setModel(this.value)">
+      <option value="">Loading...</option>
+    </select>
+    <button id="mobile-voice-btn" class="voice-btn active" onclick="toggleVoice()">Voice on</button>
+    <button id="mobile-cam-btn" class="voice-btn" onclick="toggleBrowserCam()">Cam off</button>
+  </div>
+</div>
+
+<div id="mobile-cam-container" style="display:none;background:var(--bg2);border-bottom:1px solid var(--border);padding:10px;text-align:center">
+  <div style="position:relative;width:160px;height:120px;background:#000;border-radius:var(--radius);overflow:hidden;margin:0 auto 8px">
+    <video id="browser-cam-video" autoplay playsinline muted style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1);display:none;"></video>
+    <img id="browser-cam-feed" src="/api/camera_feed" style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1);display:none;">
+  </div>
+  <div style="font-size:11px;color:var(--text2)">
+    Source: <span id="browser-cam-source">-</span> | Light: <span id="browser-cam-light">-</span><br>
+    Faces: <span id="browser-cam-faces">-</span> | Motion: <span id="browser-cam-motion">-</span> | Attention: <span id="browser-cam-attention">-</span>
+  </div>
 </div>
 
 <div id="messages"></div>
@@ -1358,7 +1758,7 @@ function toggleVoice() {
   const btn = document.getElementById('mobile-voice-btn');
   btn.textContent = voiceEnabled ? 'Voice on' : 'Voice off';
   btn.className = voiceEnabled ? 'voice-btn active' : 'voice-btn';
-  
+
   // Unlock mobile audio context on first tap
   if (voiceEnabled && !currentAudio) {
     currentAudio = new Audio();
@@ -1383,23 +1783,23 @@ async function sendChat() {
   const inp = document.getElementById('chat-input');
   const text = inp.value.trim();
   if (!text) return;
-  
+
   // Unlock mobile audio context on send tap
   if (voiceEnabled && !currentAudio) {
     currentAudio = new Audio();
     currentAudio.play().catch(()=>{});
   }
-  
+
   inp.value = '';
   inp.style.height = '42px';
-  
+
   // Optimistically add user message
   const msgEl = document.createElement('div');
   msgEl.className = 'msg msg-user';
-  msgEl.textContent = text;
+  msgEl.innerHTML = `<span class="msg-txt">${escHtml(text)}</span><button class="msg-play-btn" onclick="speakText(decodeURIComponent('${encodeURIComponent(text)}'), true)" title="Play message">▶</button>`;
   document.getElementById('messages').appendChild(msgEl);
   scrollToBottom();
-  
+
   try {
     await api('/api/chat', {text});
     refreshState();
@@ -1408,8 +1808,8 @@ async function sendChat() {
   }
 }
 
-async function speakText(text){
-  if(!voiceEnabled || !text) return;
+async function speakText(text, force = false){
+  if((!force && !voiceEnabled) || !text) return;
   try{
     const r=await fetch('/api/tts',{
       method:'POST',
@@ -1445,25 +1845,34 @@ document.getElementById('messages').addEventListener('scroll', (e) => {
 async function refreshState() {
   try {
     const data = await api('/api/state');
+    const sel = document.getElementById('mobile-model-select');
+    if (sel && data.config && data.config.model && sel.value !== data.config.model) {
+      sel.value = data.config.model;
+    }
     if (data.tick === lastTick && data.messages.length === lastMsgCount) return;
     lastTick = data.tick;
     lastMsgCount = data.messages.length;
-    
+
     const m = document.getElementById('messages');
     m.innerHTML = '';
-    
+
     data.messages.forEach(msg => {
       const d = document.createElement('div');
-      if (msg.role === 'user') d.className = 'msg msg-user';
-      else if (msg.role === 'thought') d.className = 'msg msg-thought';
-      else d.className = 'msg msg-agent';
-      
-      d.innerHTML = escHtml(msg.text).replace(/\n/g, '<br>');
+      if (msg.role === 'user') {
+        d.className = 'msg msg-user';
+        d.innerHTML = `<span class="msg-txt">${escHtml(msg.text).replace(/\n/g, '<br>')}</span><button class="msg-play-btn" onclick="speakText(decodeURIComponent('${encodeURIComponent(msg.text)}'), true)" title="Play message">▶</button>`;
+      } else if (msg.role === 'thought') {
+        d.className = 'msg msg-thought';
+        d.innerHTML = `<span class="msg-txt">${escHtml(msg.text).replace(/\n/g, '<br>')}</span><button class="msg-play-btn" onclick="speakText(decodeURIComponent('${encodeURIComponent(msg.text)}'), true)" title="Play thought">▶</button>`;
+      } else {
+        d.className = 'msg msg-agent';
+        d.innerHTML = `<span class="msg-txt">${escHtml(msg.text).replace(/\n/g, '<br>')}</span><button class="msg-play-btn" onclick="speakText(decodeURIComponent('${encodeURIComponent(msg.text)}'), true)" title="Play message">▶</button>`;
+      }
       m.appendChild(d);
     });
-    
+
     if (!isScrolledUp) scrollToBottom();
-    
+
     // TTS trigger
     if(voiceEnabled && data.messages.length > 0){
       const last = data.messages[data.messages.length - 1];
@@ -1478,13 +1887,188 @@ async function refreshState() {
   }
 }
 
-refreshState();
-setInterval(refreshState, 1500);
+let browserCamStream = null;
+let browserCamInterval = null;
+let feedInterval = null;
 
+function setupFeedRefresh() {
+  const img = document.getElementById('browser-cam-feed');
+  const container = document.getElementById('mobile-cam-container');
+  if (!img) return;
+
+  img.onload = () => {
+    if (browserCamStream) return;
+    img.style.display = 'block';
+    if (container) container.style.display = 'block';
+  };
+
+  img.onerror = () => {
+    if (browserCamStream) return;
+    img.style.display = 'none';
+    if (container) container.style.display = 'none';
+  };
+
+  if (!feedInterval) {
+    feedInterval = setInterval(() => {
+      if (browserCamStream) return;
+      img.src = '/api/camera_feed?t=' + Date.now();
+    }, 500);
+  }
+}
+
+async function toggleBrowserCam() {
+  const btn = document.getElementById('mobile-cam-btn');
+  const container = document.getElementById('mobile-cam-container');
+  const video = document.getElementById('browser-cam-video');
+  const feedImg = document.getElementById('browser-cam-feed');
+
+  if (browserCamStream) {
+    stopBrowserCam();
+    return;
+  }
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    alert('Webcam requires a Secure Context (HTTPS or localhost).\n\nTo enable on your laptop/phone:\n1. Open Chrome/Edge.\n2. Go to chrome://flags/#unsafely-treat-insecure-origin-as-secure\n3. Add ' + window.location.origin + ' and enable.\n4. Relaunch browser.');
+    return;
+  }
+
+  try {
+    browserCamStream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 320 }, height: { ideal: 240 } }
+    });
+    video.srcObject = browserCamStream;
+    container.style.display = 'block';
+    video.style.display = 'block';
+    if (feedImg) feedImg.style.display = 'none';
+    btn.textContent = 'Cam on';
+    btn.classList.add('active');
+
+    const canvas = document.createElement('canvas');
+    canvas.width = 160;
+    canvas.height = 120;
+    const ctx = canvas.getContext('2d');
+
+    browserCamInterval = setInterval(async () => {
+      if (!browserCamStream) return;
+      try {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.6);
+        const res = await api('/api/vision_frame', { image: dataUrl });
+        if (res && res.state) {
+          document.getElementById('browser-cam-faces').textContent = res.state.face_count;
+          const srcEl = document.getElementById('browser-cam-source');
+          const lightEl = document.getElementById('browser-cam-light');
+          if(srcEl) srcEl.textContent = res.state.camera_source || 'browser';
+          if(lightEl) lightEl.textContent = Number(res.state.brightness_level || 0).toFixed(2);
+          document.getElementById('browser-cam-motion').textContent = res.state.motion_level.toFixed(2);
+          document.getElementById('browser-cam-attention').textContent = res.state.attention_detected ? 'Yes' : 'No';
+        }
+      } catch (e) {
+        console.error('Failed to send mobile vision frame:', e);
+      }
+    }, 250);
+  } catch (err) {
+    console.error('Mobile camera access failed:', err);
+    alert('Failed to access camera: ' + err.message);
+    stopBrowserCam();
+  }
+}
+
+function stopBrowserCam() {
+  const btn = document.getElementById('mobile-cam-btn');
+  const container = document.getElementById('mobile-cam-container');
+  const video = document.getElementById('browser-cam-video');
+  const feedImg = document.getElementById('browser-cam-feed');
+
+  if (browserCamInterval) {
+    clearInterval(browserCamInterval);
+    browserCamInterval = null;
+  }
+  if (browserCamStream) {
+    browserCamStream.getTracks().forEach(track => track.stop());
+    browserCamStream = null;
+  }
+  if (video) {
+    video.srcObject = null;
+    video.style.display = 'none';
+  }
+  if (feedImg) {
+    feedImg.src = '/api/camera_feed?t=' + Date.now();
+  } else if (container) {
+    container.style.display = 'none';
+  }
+  if (btn) {
+    btn.textContent = 'Cam off';
+    btn.classList.remove('active');
+  }
+
+  const faces = document.getElementById('browser-cam-faces');
+  const source = document.getElementById('browser-cam-source');
+  const light = document.getElementById('browser-cam-light');
+  const motion = document.getElementById('browser-cam-motion');
+  const attention = document.getElementById('browser-cam-attention');
+  if (source) source.textContent = '-';
+  if (light) light.textContent = '-';
+  if (faces) faces.textContent = '-';
+  if (motion) motion.textContent = '-';
+  if (attention) attention.textContent = '-';
+}
+
+async function loadModels(activeModel){
+  try {
+    const data = await api('/api/models');
+    const sel = document.getElementById('mobile-model-select');
+    if(!sel) return;
+    sel.innerHTML = '';
+    (data.models || []).forEach(m => {
+      const o = document.createElement('option');
+      o.value = m; o.textContent = m;
+      if (activeModel && m === activeModel) o.selected = true;
+      sel.appendChild(o);
+    });
+  } catch(e) {
+    console.error(e);
+  }
+}
+
+async function setModel(v) {
+  try {
+    await api('/api/config', {model: v});
+  } catch(e) {
+    console.error(e);
+  }
+}
+
+async function init() {
+  const state = await api('/api/state');
+  const activeModel = (state && state.config) ? state.config.model : null;
+  await loadModels(activeModel);
+  await refreshState();
+  setupFeedRefresh();
+}
+
+init();
+setInterval(refreshState, 1500);
 </script>
 </body>
 </html>
 """
+
+class SafeThreadingHTTPServer(ThreadingHTTPServer):
+    ssl_context = None
+
+    def get_request(self):
+        sock, addr = super().get_request()
+        if self.ssl_context is not None:
+            sock = self.ssl_context.wrap_socket(sock, server_side=True, do_handshake_on_connect=False)
+        return sock, addr
+
+    def handle_error(self, request, client_address):
+        import sys
+        exctype, value, tb = sys.exc_info()
+        if exctype in (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, ssl.SSLError):
+            return
+        super().handle_error(request, client_address)
 
 # ── main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
@@ -1494,19 +2078,47 @@ if __name__ == "__main__":
     parser.add_argument("--model", default=None, help="Ollama model name")
     parser.add_argument("--live", action="store_true", help="Call the model (default for the web server)")
     parser.add_argument("--dry", action="store_true", help="Force dry-run mode")
+    parser.add_argument("--local-cam", action="store_true", help="Use the server machine's local camera instead of browser camera input")
+    parser.add_argument("--no-cam", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--http", action="store_true", help="Serve plain HTTP instead of HTTPS")
+    parser.add_argument("--certfile", default=os.path.join("certs", "server.crt"), help="TLS certificate file for HTTPS")
+    parser.add_argument("--keyfile", default=os.path.join("certs", "server.key"), help="TLS private key file for HTTPS")
     args = parser.parse_args()
 
     _configure_runtime(model=args.model, live=(args.live or not args.dry), dry=args.dry)
-    pe.reset()
+    if not pe.load_state():
+        pe.reset()
+
+    local_camera_allowed = bool(args.local_cam and not args.no_cam)
+    if local_camera_allowed:
+        vision_sensor.start()
+    else:
+        vision_sensor.set_idle("none", "")
+        print("[Vision] Browser camera mode. Waiting for /api/vision_frame from the user's browser device.")
     HOST, PORT = args.host, args.port
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
-    local_url = f"http://localhost:{PORT}"
+    server = SafeThreadingHTTPServer((HOST, PORT), Handler)
+    use_https = not args.http
+    scheme = "https" if use_https else "http"
+    if use_https:
+        certfile = os.path.abspath(args.certfile)
+        keyfile = os.path.abspath(args.keyfile)
+        if not os.path.exists(certfile) or not os.path.exists(keyfile):
+            raise FileNotFoundError(
+                f"HTTPS certificate files are missing: {certfile} and {keyfile}. "
+                "Create them or start with --http."
+            )
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(certfile=certfile, keyfile=keyfile)
+        server.ssl_context = ctx
+
+    local_url = f"{scheme}://localhost:{PORT}"
     lan_ip = _get_lan_ip()
-    lan_url = f"http://{lan_ip}:{PORT}"
-    shown_url = lan_url if HOST in ("0.0.0.0", "", "::") else f"http://{HOST}:{PORT}"
+    lan_url = f"{scheme}://{lan_ip}:{PORT}"
+    shown_url = lan_url if HOST in ("0.0.0.0", "", "::") else f"{scheme}://{HOST}:{PORT}"
     print(f"\nHousehold Agent running")
     print(f"Local : {local_url}", flush=True)
     print(f"Laptop: {shown_url}", flush=True)
+    print(f"Camera: browser device camera over {'HTTPS' if use_https else 'HTTP'}")
     print(f"Model : {pe.CONFIG['OLLAMA_MODEL']}")
     print(f"Mode  : {'LIVE  (real model calls)' if not pe.CONFIG['DRY_RUN'] else 'DRY RUN  (switch to live in the GUI or pass --live)'}")
     print(f"\nPress Ctrl+C to stop.\n")

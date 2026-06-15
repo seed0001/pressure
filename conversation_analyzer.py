@@ -36,6 +36,7 @@ EMPTY_PACKET = {
     "conversation_depth":  0.0,
     "emotional_weight":    0.0,
     "new_inference_count": 0,
+    "unstructured_presence": 0.0,
 }
 
 ANALYZE_SYSTEM = """You are a conversation analysis engine. You read a chat history and produce a structured snapshot of its current state.
@@ -50,7 +51,8 @@ Output ONLY valid JSON — no prose, no markdown fences. Use this exact shape:
   "focus_candidate": "...",
   "conversation_depth": 0.0,
   "emotional_weight": 0.0,
-  "new_inference_count": 0
+  "new_inference_count": 0,
+  "unstructured_presence": 0.0
 }
 
 Definitions:
@@ -63,6 +65,7 @@ Definitions:
 - conversation_depth: 0.0 = surface small talk, 1.0 = the deepest personal disclosure. Be honest.
 - emotional_weight: 0.0 = neutral last message, 1.0 = highly charged last message.
 - new_inference_count: integer count of meaningful new facts or connections you noticed that weren't stated directly.
+- unstructured_presence: 0.0 = highly task-oriented, objective-seeking, or structurally unresolved conversation; 1.0 = purely relaxed, open-ended, objective-free, or 'just hanging out' state (e.g. user says they are open to anything, just chilling, or no immediate problem exists).
 
 Rules:
 - Do not invent. Only report what is actually in the conversation.
@@ -71,7 +74,7 @@ Rules:
 """
 
 
-def analyze(history: list[dict], call_model_fn, tick: int = 0) -> dict:
+def analyze(history: list[dict], call_model_fn, tick: int = 0, visual_context: str = "") -> dict:
     """
     Analyze the conversation history and return a context packet.
     Falls back to EMPTY_PACKET on any error.
@@ -97,6 +100,8 @@ def analyze(history: list[dict], call_model_fn, tick: int = 0) -> dict:
 
     transcript = "\n".join(transcript_lines)
     prompt = f"Analyze this conversation:\n\n{transcript}"
+    if visual_context:
+        prompt += f"\n\nEnvironmental Context:\n{visual_context}"
 
     try:
         raw = call_model_fn(ANALYZE_SYSTEM, [{"role": "user", "content": prompt}])
@@ -109,8 +114,10 @@ def analyze(history: list[dict], call_model_fn, tick: int = 0) -> dict:
         result["conversation_depth"] = float(max(0.0, min(1.0, result.get("conversation_depth", 0.0))))
         result["emotional_weight"]   = float(max(0.0, min(1.0, result.get("emotional_weight", 0.0))))
         result["new_inference_count"] = int(max(0, result.get("new_inference_count", 0)))
+        result["unstructured_presence"] = float(max(0.0, min(1.0, result.get("unstructured_presence", 0.0))))
         return result
-    except Exception:
+    except Exception as e:
+        print(f"[conversation_analyzer] Error: {e}")
         return dict(EMPTY_PACKET)
 
 
@@ -130,6 +137,7 @@ def packet_to_signal_deltas(packet: dict) -> dict:
     topics  = len(packet.get("active_topics", []))
     charges = packet.get("emotional_charge", [])
     rel     = packet.get("relationship_state", {})
+    unstructured_presence = packet.get("unstructured_presence", 0.0)
 
     # user_stress: emotional weight + grief/frustration/anxiety in charge
     stress_charges = {"grief", "frustration", "anxiety", "anger", "sadness", "confusion"}
@@ -166,5 +174,6 @@ def packet_to_signal_deltas(packet: dict) -> dict:
         "unresolved_topics":    round(unresolved_topics, 3),
         "emotional_weight":     round(emotional_weight, 3),
         "new_inference_count":  round(new_inference_count, 3),
+        "unstructured_presence": round(unstructured_presence, 3),
         # preserve existing signals — caller merges, not replaces
     }
