@@ -37,11 +37,13 @@ _latest_frame_time = 0.0
 
 def get_current_state() -> dict:
     """Thread-safe getter for the rest of the application."""
+    _check_browser_timeout()
     with _lock:
         return dict(_state)
 
 def get_status() -> dict:
     """Return vision state plus operational camera diagnostics."""
+    _check_browser_timeout()
     with _lock:
         status = dict(_state)
         status["running"] = bool(_running)
@@ -71,13 +73,46 @@ def update_state(new_state: dict):
         _latest_frame_time = time.time()
 
 def set_idle(source: str = "none", error: str = "") -> None:
-    """Set camera operational status without claiming a fresh frame arrived."""
-    global _running
+    """Set camera operational status and clear active detection indicators."""
+    global _running, _latest_frame_jpeg
     _running = False
     with _lock:
-        _state["camera_source"] = source
-        _state["camera_error"] = error
-        _state["camera_blocked"] = bool(error)
+        _state.update({
+            "person_present": False,
+            "face_present": False,
+            "face_count": 0,
+            "motion_level": 0.0,
+            "brightness_level": 0.0,
+            "scene_changed": False,
+            "camera_blocked": bool(error),
+            "novelty_score": 0.0,
+            "attention_detected": False,
+            "camera_source": source,
+            "camera_error": error,
+        })
+        _latest_frame_jpeg = None
+
+def _check_browser_timeout() -> None:
+    """Check if the browser camera has stopped sending frames (4-second timeout)."""
+    global _latest_frame_jpeg
+    with _lock:
+        if _state.get("camera_source") == "browser":
+            if time.time() - _latest_frame_time > 4.0:
+                _state.update({
+                    "person_present": False,
+                    "face_present": False,
+                    "face_count": 0,
+                    "motion_level": 0.0,
+                    "brightness_level": 0.0,
+                    "scene_changed": False,
+                    "camera_blocked": False,
+                    "novelty_score": 0.0,
+                    "attention_detected": False,
+                    "camera_source": "none",
+                    "camera_error": "",
+                })
+                _latest_frame_jpeg = None
+
 
 def _vision_loop():
     global _state, _running, _latest_frame_time
@@ -326,5 +361,6 @@ def process_frame(frame) -> dict:
 
 def get_latest_frame() -> bytes:
     """Retrieve the raw bytes of the latest processed JPEG frame."""
+    _check_browser_timeout()
     global _latest_frame_jpeg
     return _latest_frame_jpeg

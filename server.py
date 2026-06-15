@@ -269,6 +269,8 @@ def _speak_edge_tts(text):
     text = text[:5000]
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "edge_tts_speak.js")
     voice = pe.CONFIG.get("TTS_VOICE", "en-IE-EmilyNeural")
+    if voice == "LuxTTS":
+        voice = "en-IE-EmilyNeural"
     result = subprocess.run(
         [_node_executable(), script, text, voice],
         stdout=subprocess.PIPE,
@@ -283,6 +285,54 @@ def _speak_edge_tts(text):
     if not result.stdout:
         raise RuntimeError("Edge TTS returned no audio")
     return result.stdout
+
+_lux_tts_instance = None
+_lux_encoded_prompt = None
+
+def _get_lux_tts():
+    global _lux_tts_instance, _lux_encoded_prompt
+    if _lux_tts_instance is None:
+        try:
+            from zipvoice.luxvoice import LuxTTS
+            print("[TTS] Initializing LuxTTS on CPU...")
+            _lux_tts_instance = LuxTTS(device='cpu')
+            ref_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Rob.mp3")
+            if os.path.exists(ref_path):
+                print(f"[TTS] Encoding voice sample: {ref_path}")
+                _lux_encoded_prompt = _lux_tts_instance.encode_prompt(ref_path)
+            else:
+                print(f"[WARNING] Voice sample not found at {ref_path}")
+        except Exception as e:
+            print(f"[ERROR] Failed to load LuxTTS: {e}")
+    return _lux_tts_instance, _lux_encoded_prompt
+
+def _speak_tts(text):
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("No text to speak")
+    
+    voice = pe.CONFIG.get("TTS_VOICE", "en-IE-EmilyNeural")
+    if voice == "LuxTTS":
+        tts, encoded = _get_lux_tts()
+        if tts is not None and encoded is not None:
+            try:
+                import io
+                import soundfile as sf
+                # Generate speech
+                audio_tensor = tts.generate_speech(text, encoded)
+                audio_np = audio_tensor.numpy().squeeze()
+                
+                out_io = io.BytesIO()
+                sf.write(out_io, audio_np, 48000, format='wav')
+                wav_data = out_io.getvalue()
+                return wav_data, "audio/wav"
+            except Exception as e:
+                print(f"[TTS] LuxTTS failed for '{text}', falling back to Edge TTS: {e}")
+        else:
+            print("[TTS] LuxTTS not initialized, falling back to Edge TTS")
+            
+    # Default to Edge TTS
+    return _speak_edge_tts(text), "audio/mpeg"
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a): pass  # silence request logs
@@ -306,9 +356,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
-    def _audio(self, body):
+    def _audio(self, body, content_type="audio/mpeg"):
         self.send_response(200)
-        self.send_header("Content-Type", "audio/mpeg")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", len(body))
         self.send_header("Cache-Control", "no-store")
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -465,7 +515,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/tts":
             try:
-                self._audio(_speak_edge_tts(body.get("text", "")))
+                audio_data, mime_type = _speak_tts(body.get("text", ""))
+                self._audio(audio_data, mime_type)
             except Exception as exc:
                 self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
             return
@@ -503,6 +554,16 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/vision_state":
             try:
                 vision_sensor.update_state(body)
+                with _lock:
+                    signals.update(vision_sensor.get_current_state())
+                self._json({"ok": True})
+            except Exception as exc:
+                self._json({"error": f"{type(exc).__name__}: {exc}"}, 400)
+            return
+
+        if path == "/api/stop_browser_cam":
+            try:
+                vision_sensor.set_idle("none", "")
                 with _lock:
                     signals.update(vision_sensor.get_current_state())
                 self._json({"ok": True})
@@ -673,6 +734,10 @@ HTML = r"""<!DOCTYPE html>
 </head>
 <body>
 
+<div id="http-warning-banner" style="display:none;background:#d93838;color:#fff;padding:8px 12px;font-size:13px;text-align:center;font-weight:600;cursor:pointer;z-index:9999;" onclick="switchToHttps()">
+  ⚠️ Running over insecure HTTP. Webcam requires HTTPS. Click here to switch to secure HTTPS.
+</div>
+
 <div id="topbar">
   <h1>&#x2302; Household Agent</h1>
   <span id="mode-badge" class="badge badge-live">LIVE</span>
@@ -680,6 +745,7 @@ HTML = r"""<!DOCTYPE html>
   <span id="tick-display">tick 0</span>
   <div class="spacer"></div>
   <select id="voice-select" style="width:140px;background:var(--bg3);color:var(--text1);border:1px solid var(--border1);border-radius:6px;padding:4px;margin-right:8px;" onchange="setVoice(this.value)">
+    <option value="LuxTTS">Lux (Rob Clone)</option>
     <option value="en-IE-EmilyNeural">Emily (Female)</option>
     <option value="en-US-AndrewNeural">Andrew (Male)</option>
     <option value="en-US-EmmaNeural">Emma (Female)</option>
@@ -1610,6 +1676,7 @@ async function toggleBrowserCam() {
 }
 
 function stopBrowserCam() {
+  api('/api/stop_browser_cam', {}).catch(e => console.error(e));
   const btn = document.getElementById('browser-cam-btn');
   const video = document.getElementById('browser-cam-video');
   const feedImg = document.getElementById('browser-cam-feed');
@@ -1658,7 +1725,19 @@ function stopBrowserCam() {
   if (attention) attention.textContent = '-';
 }
 
+function checkSecureContext() {
+  if (window.location.protocol === 'http:' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+    const banner = document.getElementById('http-warning-banner');
+    if (banner) banner.style.display = 'block';
+  }
+}
+
+function switchToHttps() {
+  window.location.href = 'https://' + window.location.host + window.location.pathname + window.location.search;
+}
+
 async function init() {
+  checkSecureContext();
   const state = await api('/api/state');
   const activeModel = (state && state.config) ? state.config.model : null;
   await loadModels(activeModel);
@@ -1691,9 +1770,19 @@ MOBILE_HTML = r"""<!DOCTYPE html>
   body{background:var(--bg);color:var(--text);height:100vh;height:100dvh;display:flex;flex-direction:column;overflow:hidden}
 
   #topbar{display:flex;align-items:center;justify-content:space-between;padding:12px;border-bottom:1px solid var(--border);background:var(--bg2);flex-shrink:0}
-  #topbar h1{font-size:16px;font-weight:600;letter-spacing:.02em}
-  .voice-btn{background:var(--bg3);border:1px solid var(--border2);color:var(--text2);border-radius:12px;padding:4px 10px;font-size:12px;cursor:pointer}
+  #topbar h1{font-size:16px;font-weight:600;letter-spacing:.02em;white-space:nowrap}
+  .voice-btn{background:var(--bg3);border:1px solid var(--border2);color:var(--text2);border-radius:12px;padding:6px 10px;font-size:12px;cursor:pointer;white-space:nowrap;display:inline-flex;align-items:center;gap:4px;font-weight:500;transition:all 0.2s}
   .voice-btn.active{background:var(--blue2);color:#fff;border-color:var(--blue)}
+  #mobile-model-select{max-width:110px;background:var(--bg3);color:var(--text);border:1px solid var(--border2);border-radius:12px;padding:6px 8px;font-size:12px;outline:none;font-weight:500}
+
+  #http-warning-banner{display:none;background:#d93838;color:#fff;padding:8px 12px;font-size:12px;text-align:center;font-weight:600;cursor:pointer;flex-shrink:0;z-index:9999;box-shadow:0 2px 8px rgba(0,0,0,0.2);animation:slideDown 0.3s ease-out}
+  @keyframes slideDown{from{transform:translateY(-100%)}to{transform:translateY(0)}}
+
+  @media(max-width: 380px) {
+    #topbar h1 { font-size: 14px; }
+    #mobile-model-select { max-width: 90px; padding: 4px 6px; font-size: 11px; }
+    .voice-btn { padding: 4px 6px; font-size: 11px; }
+  }
 
   #messages{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px}
   #messages::-webkit-scrollbar{width:0px;background:transparent;} /* Hide scrollbar for mobile */
@@ -1716,14 +1805,18 @@ MOBILE_HTML = r"""<!DOCTYPE html>
 </head>
 <body>
 
+<div id="http-warning-banner" onclick="switchToHttps()">
+  ⚠️ Running over insecure HTTP. Webcam requires HTTPS. Tap here to switch to secure HTTPS.
+</div>
+
 <div id="topbar">
   <h1>Household Agent</h1>
   <div style="display:flex;gap:6px;align-items:center">
-    <select id="mobile-model-select" style="max-width:110px;background:var(--bg3);color:var(--text);border:1px solid var(--border2);border-radius:12px;padding:4px 8px;font-size:12px;outline:none;" onchange="setModel(this.value)">
+    <select id="mobile-model-select" onchange="setModel(this.value)">
       <option value="">Loading...</option>
     </select>
-    <button id="mobile-voice-btn" class="voice-btn active" onclick="toggleVoice()">Voice on</button>
-    <button id="mobile-cam-btn" class="voice-btn" onclick="toggleBrowserCam()">Cam off</button>
+    <button id="mobile-voice-btn" class="voice-btn active" onclick="toggleVoice()">🔊 Voice</button>
+    <button id="mobile-cam-btn" class="voice-btn" onclick="toggleBrowserCam()">📷 Cam</button>
   </div>
 </div>
 
@@ -1756,7 +1849,7 @@ let lastMsgSignature = '';
 function toggleVoice() {
   voiceEnabled = !voiceEnabled;
   const btn = document.getElementById('mobile-voice-btn');
-  btn.textContent = voiceEnabled ? 'Voice on' : 'Voice off';
+  btn.innerHTML = voiceEnabled ? '🔊 Voice' : '🔇 Muted';
   btn.className = voiceEnabled ? 'voice-btn active' : 'voice-btn';
 
   // Unlock mobile audio context on first tap
@@ -1940,7 +2033,7 @@ async function toggleBrowserCam() {
     container.style.display = 'block';
     video.style.display = 'block';
     if (feedImg) feedImg.style.display = 'none';
-    btn.textContent = 'Cam on';
+    btn.innerHTML = '📹 Live';
     btn.classList.add('active');
 
     const canvas = document.createElement('canvas');
@@ -1975,6 +2068,7 @@ async function toggleBrowserCam() {
 }
 
 function stopBrowserCam() {
+  api('/api/stop_browser_cam', {}).catch(e => console.error(e));
   const btn = document.getElementById('mobile-cam-btn');
   const container = document.getElementById('mobile-cam-container');
   const video = document.getElementById('browser-cam-video');
@@ -1998,7 +2092,7 @@ function stopBrowserCam() {
     container.style.display = 'none';
   }
   if (btn) {
-    btn.textContent = 'Cam off';
+    btn.innerHTML = '📷 Cam';
     btn.classList.remove('active');
   }
 
@@ -2039,7 +2133,19 @@ async function setModel(v) {
   }
 }
 
+function checkSecureContext() {
+  if (window.location.protocol === 'http:' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+    const banner = document.getElementById('http-warning-banner');
+    if (banner) banner.style.display = 'block';
+  }
+}
+
+function switchToHttps() {
+  window.location.href = 'https://' + window.location.host + window.location.pathname + window.location.search;
+}
+
 async function init() {
+  checkSecureContext();
   const state = await api('/api/state');
   const activeModel = (state && state.config) ? state.config.model : null;
   await loadModels(activeModel);
@@ -2060,7 +2166,26 @@ class SafeThreadingHTTPServer(ThreadingHTTPServer):
     def get_request(self):
         sock, addr = super().get_request()
         if self.ssl_context is not None:
-            sock = self.ssl_context.wrap_socket(sock, server_side=True, do_handshake_on_connect=False)
+            is_tls = True
+            try:
+                old_timeout = sock.gettimeout()
+                sock.settimeout(0.5)
+                try:
+                    first_byte = sock.recv(1, socket.MSG_PEEK)
+                    if first_byte and first_byte != b'\x16':
+                        is_tls = False
+                except (socket.timeout, OSError):
+                    pass
+                finally:
+                    sock.settimeout(old_timeout)
+            except Exception:
+                pass
+
+            if is_tls:
+                try:
+                    sock = self.ssl_context.wrap_socket(sock, server_side=True, do_handshake_on_connect=False)
+                except Exception as e:
+                    print(f"[Server] SSL wrap failed: {e}")
         return sock, addr
 
     def handle_error(self, request, client_address):
