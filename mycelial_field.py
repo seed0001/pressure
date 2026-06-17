@@ -230,9 +230,10 @@ class MycelialField:
         self.tick_count = tick
         energy = self._context_energy(pressure_context)
         for node in self.nodes.values():
-            previous = node.activation
-            node.activation = max(0.0, node.activation * (0.965 - node.fatigue * 0.03))
-            node.fatigue = _clamp(node.fatigue * 0.94 + max(0.0, previous - node.activation) * 0.02)
+            # High fatigue makes activation drop off faster; fatigue itself
+            # rests off naturally here (it is accrued from usage in _activate).
+            node.activation = max(0.0, node.activation * (0.965 - node.fatigue * 0.05))
+            node.fatigue = _clamp(node.fatigue * 0.92)
             if node.activation > 0.08:
                 node.stability = _clamp(node.stability * 0.982 + node.activation * energy * atp * 0.025)
             else:
@@ -393,6 +394,7 @@ class MycelialField:
     def _activate(self, node: FieldNode, energy: float, tick: int) -> None:
         energy = _clamp(energy)
         node.activation = _clamp(node.activation + energy * (1.0 - node.activation * 0.35))
+        node.fatigue = _clamp(node.fatigue + energy * 0.08)   # usage tires a node
         node.exposures += energy
         node.wins += 1.0
         node.last_tick = tick

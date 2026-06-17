@@ -1843,10 +1843,13 @@ def _phase_c(pressures: dict, signals: dict,
         if allowed:
             if action_type == "reach_out":
                 payload = handle_reach_out(ctx)
+                metabolism.spend(0.15)   # speaking costs energy
             elif action_type == "internal_thought":
                 payload = handle_internal_thought(ctx)
+                metabolism.spend(0.05)   # thinking costs a little
             else:
                 payload = handle_research(ctx)
+                metabolism.spend(0.25)   # researching costs the most
 
             handle_journal(ctx, dispatched=True, payload=payload)
             updated[bucket] = pressures[bucket] * (1.0 - release)

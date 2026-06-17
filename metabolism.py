@@ -43,9 +43,13 @@ class MetabolismState:
             values = [abs(float(v or 0.0)) for v in pressure_context.values()]
             pressure_load = _clamp(sum(values) / max(1, len(values)))
 
-        recovery = 0.035 + max(0.0, 0.35 - pressure_load) * 0.05
-        self.atp = _clamp(self.atp + recovery - pressure_load * 0.01)
-        self.fatigue = _clamp(self.fatigue * 0.965 + pressure_load * 0.01)
+        # High pressure load should actively drain ATP and accumulate fatigue.
+        recovery = 0.02 + max(0.0, 0.35 - pressure_load) * 0.03
+        drain = pressure_load * 0.06
+        self.atp = _clamp(self.atp + recovery - drain)
+        # Fatigue builds under sustained load, but rests off when load is low.
+        fatigue_accumulation = max(0.0, pressure_load - 0.3) * 0.05
+        self.fatigue = _clamp(self.fatigue * 0.96 + fatigue_accumulation)
         self.rest_drive = _clamp((1.0 - self.atp) * 0.65 + self.fatigue * 0.55)
         self.last_demand *= 0.85
 
