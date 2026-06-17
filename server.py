@@ -1,5 +1,5 @@
 """
-Household Agent — GUI Server
+Living Conversational Container - GUI Server
 Run:  python server.py
 Then open:  https://localhost:7437
 """
@@ -8,9 +8,13 @@ import sys
 import os
 import subprocess
 
-# Auto-redirect to virtual environment if running outside it
+# Optional inherited redirect; disabled by the Living Container launcher.
 VENV_PYTHON = os.path.normpath(r"c:\users\aztre\appdata\local\hermes\hermes-agent\venv\Scripts\python.exe")
-if os.path.exists(VENV_PYTHON) and os.path.normpath(sys.executable).lower() != VENV_PYTHON.lower():
+if (
+    not os.environ.get("LIVING_CONTAINER_NO_VENV_REDIRECT")
+    and os.path.exists(VENV_PYTHON)
+    and os.path.normpath(sys.executable).lower() != VENV_PYTHON.lower()
+):
     res = subprocess.run([VENV_PYTHON] + sys.argv)
     sys.exit(res.returncode)
 
@@ -26,6 +30,8 @@ import ssl
 import os
 import shutil
 import subprocess
+import datetime
+import ipaddress
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 import pressure_engine as pe
 import primitive_concept_engine as pc_module
@@ -253,6 +259,60 @@ def _get_lan_ip():
         except Exception:
             return "127.0.0.1"
 
+def _ensure_self_signed_cert(certfile, keyfile):
+    """Create a local HTTPS cert for localhost and the current LAN IP."""
+    certfile = os.path.abspath(certfile)
+    keyfile = os.path.abspath(keyfile)
+    if os.path.exists(certfile) and os.path.exists(keyfile):
+        return
+    try:
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+    except Exception as e:
+        raise FileNotFoundError(
+            f"HTTPS certificate files are missing: {certfile} and {keyfile}, "
+            f"and automatic certificate generation is unavailable ({e}). "
+            "Install cryptography or start with --http."
+        )
+
+    os.makedirs(os.path.dirname(certfile), exist_ok=True)
+    lan_ip = _get_lan_ip()
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, "Living Container Local")
+    ])
+    alt_names = [
+        x509.DNSName("localhost"),
+        x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+    ]
+    try:
+        alt_names.append(x509.IPAddress(ipaddress.ip_address(lan_ip)))
+    except Exception:
+        pass
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.datetime.utcnow() - datetime.timedelta(days=1))
+        .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=1095))
+        .add_extension(x509.SubjectAlternativeName(alt_names), critical=False)
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    with open(keyfile, "wb") as f:
+        f.write(key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        ))
+    with open(certfile, "wb") as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
+    print(f"[Server] Created HTTPS certificate for localhost, 127.0.0.1, {lan_ip}")
+
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 def _node_executable():
     bundled = os.path.join(
@@ -408,6 +468,9 @@ class Handler(BaseHTTPRequestHandler):
                 "graph_summary": pe.graph.summary_text(max_nodes=12),
                 "graph_counts": {"nodes": len(pe.graph.nodes), "edges": len(pe.graph.edges)},
                 "memory_field": pe.get_memory_field(),
+                "mycelial_field": pe.get_mycelial_field(),
+                "metabolism": pe.get_metabolism(),
+                "ecology": pe.get_ecology(),
                 "messages":   chat_messages[-60:],
                 "edge_totals": edge_totals,
                 "edges": [[s,t,w,d,str(w/d)[:4]] for s,t,w,d in pe.CONFIG["edges"]],
@@ -432,6 +495,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/memory_field":
             self._json(pe.get_memory_field())
+            return
+        if path == "/api/mycelial_field":
+            self._json(pe.get_mycelial_field())
+            return
+        if path == "/api/metabolism":
+            self._json(pe.get_metabolism())
+            return
+        if path == "/api/ecology":
+            self._json(pe.get_ecology())
             return
         if path == "/api/camera_feed":
             img_bytes = vision_sensor.get_latest_frame()
@@ -500,6 +572,12 @@ class Handler(BaseHTTPRequestHandler):
                     if k in signals:
                         signals[k] = round(float(v), 3)
             self._json({"ok": True})
+            return
+
+        if path == "/api/ecology_metrics":
+            state = pe.ingest_ecology_metrics(body)
+            pe.save_state()
+            self._json({"ok": True, "ecology": state})
             return
 
         if path == "/api/config":
@@ -602,7 +680,7 @@ HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Household Agent</title>
+<title>Living Container</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
   :root{
@@ -739,7 +817,7 @@ HTML = r"""<!DOCTYPE html>
 </div>
 
 <div id="topbar">
-  <h1>&#x2302; Household Agent</h1>
+  <h1>&#x2302; Living Container</h1>
   <span id="mode-badge" class="badge badge-live">LIVE</span>
   <span id="model-status" style="font-size:11px;color:var(--text3)">model idle</span>
   <span id="tick-display">tick 0</span>
@@ -759,7 +837,7 @@ HTML = r"""<!DOCTYPE html>
     <option value="">Loading models…</option>
   </select>
   <button onclick="toggleDryRun()" id="dry-btn">Enable dry run</button>
-  <button class="danger" onclick="doClearMemory()" title="Clear semantic knowledge graph and episodic memory">Clear Memory</button>
+  <button class="danger" onclick="doClearMemory()" title="Clear pressure memory, mycelial field, and compatibility graph">Clear Memory</button>
   <button class="danger" onclick="doReset()">Reset</button>
 </div>
 
@@ -1154,12 +1232,12 @@ async function doReset(){
 }
 
 async function doClearMemory(){
-  if (!confirm("Are you sure you want to clear all semantic graph and episodic dialogue memory? This cannot be undone.")) return;
+  if (!confirm("Are you sure you want to clear pressure memory, mycelial field memory, and the compatibility graph? This cannot be undone.")) return;
   await api('/api/clear_memory',{});
   spokenMessageKeys.clear();
   if(currentAudio) currentAudio.pause();
   document.getElementById('messages').innerHTML=
-    '<div class="msg msg-system">Memory cleared. Knowledge graph and episodic dialogue wiped.</div>';
+    '<div class="msg msg-system">Memory cleared. Pressure memory, mycelial field, and compatibility graph wiped.</div>';
   lastMsgSignature='';
   await refresh();
 }
@@ -1755,7 +1833,7 @@ MOBILE_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Household Agent Chat</title>
+<title>Living Container Chat</title>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <style>
   :root{
@@ -1810,7 +1888,7 @@ MOBILE_HTML = r"""<!DOCTYPE html>
 </div>
 
 <div id="topbar">
-  <h1>Household Agent</h1>
+  <h1>Living Container</h1>
   <div style="display:flex;gap:6px;align-items:center">
     <select id="mobile-model-select" onchange="setModel(this.value)">
       <option value="">Loading...</option>
@@ -2197,7 +2275,7 @@ class SafeThreadingHTTPServer(ThreadingHTTPServer):
 
 # ── main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Household Agent GUI server")
+    parser = argparse.ArgumentParser(description="Living Container GUI server")
     parser.add_argument("--host", default="0.0.0.0", help="Host/interface to bind")
     parser.add_argument("--port", type=int, default=7437, help="Port to listen on")
     parser.add_argument("--model", default=None, help="Ollama model name")
@@ -2227,11 +2305,7 @@ if __name__ == "__main__":
     if use_https:
         certfile = os.path.abspath(args.certfile)
         keyfile = os.path.abspath(args.keyfile)
-        if not os.path.exists(certfile) or not os.path.exists(keyfile):
-            raise FileNotFoundError(
-                f"HTTPS certificate files are missing: {certfile} and {keyfile}. "
-                "Create them or start with --http."
-            )
+        _ensure_self_signed_cert(certfile, keyfile)
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(certfile=certfile, keyfile=keyfile)
         server.ssl_context = ctx
@@ -2240,7 +2314,7 @@ if __name__ == "__main__":
     lan_ip = _get_lan_ip()
     lan_url = f"{scheme}://{lan_ip}:{PORT}"
     shown_url = lan_url if HOST in ("0.0.0.0", "", "::") else f"{scheme}://{HOST}:{PORT}"
-    print(f"\nHousehold Agent running")
+    print(f"\nLiving Container running")
     print(f"Local : {local_url}", flush=True)
     print(f"Laptop: {shown_url}", flush=True)
     print(f"Camera: browser device camera over {'HTTPS' if use_https else 'HTTP'}")

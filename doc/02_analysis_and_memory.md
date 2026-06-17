@@ -1,44 +1,158 @@
-# Analysis, Memory, and Vision
+# Analysis, Memory, Metabolism, and Ecology
 
-This section covers how the agent perceives the world, reasons about it, and remembers it across sessions.
+The Living Conversational Container has several layers of perception and memory.
+They do not all mean the same thing. A first mention is not durable memory; a
+stable memory is something that has survived pressure, resonance, and time.
 
-## 1. Conversation Analyzer (`conversation_analyzer.py`)
-Instead of simply passing raw text to the pressure engine, the agent uses an LLM-powered analyzer to convert chat history and ambient environment context into a structured **Context Packet**.
-The packet extracts:
-- `active_topics`: Recurring subjects in the conversation.
-- `emotional_charge`: Tones like grief, frustration, trust.
-- `unresolved_openings`: Dangling threads or unanswered questions.
-- `curiosity_targets`: Things the agent wants to ask about.
-- `relationship_state`: Trajectories of trust and tension.
-- `conversation_depth`: A 0.0 to 1.0 score of how deep the talk is.
+## Conversation Analyzer
 
-This packet is translated into numeric signals (e.g., high tension + unresolved openings -> `knowledge_gap` and `user_stress` spikes), which feed into the Pressure Engine.
+`conversation_analyzer.py` converts recent dialogue and optional visual context
+into a structured packet.
 
-## 2. Knowledge Graph (`knowledge_graph.py`)
-The agent's long-term memory is a directed graph of Nodes and Edges.
-- **Nodes**: Represent concepts, people, or objects (e.g., "divorce", "Alabama"). Each node holds a list of plain-English facts and a confidence score.
-- **Edges**: Represent relationships between nodes (e.g., "User" -> "lives in" -> "Alabama").
+It can identify:
 
-The graph is updated by the LLM during conversation analysis or after web research. Instead of keyword-based retrieval, the agent performs a semantic similarity search using vector embeddings over the graph's nodes and facts to inject the most relevant nodes and relationships into the prompt.
+- active topics;
+- emotional charge;
+- unresolved openings;
+- curiosity targets;
+- relationship state;
+- conversation depth;
+- unstructured presence.
 
-## 3. Vector Embeddings and Episodic Memory (`memory_manager.py`)
-To prevent the agent from losing track of conversation history and key facts, it integrates a multi-layer semantic memory system:
-- **Ollama Vector Embeddings**: The agent attempts to query a local Ollama service (`/api/embed` or `/api/embeddings` targeting a model like `llama3.2`) to compute high-dimensional semantic vector embeddings.
-- **Deterministic Hash-Vector Fallback**: If Ollama is offline or doesn't support embedding APIs, the system falls back to a deterministic 128-dimensional pseudo-random character-hash distribution based on a NumPy random state. This guarantees similarity computations continue working in any offline/development state.
-- **Episodic Memory**: Every conversation exchange (the user message and agent response) is stored as a formatted episodic dialogue turn in `data/episodic_memory.json` along with its computed embedding vector.
-- **Semantic Search**:
-  - **Graph Semantic Search**: Rather than matching keywords, the agent retrieves relevant context by comparing the query's embedding vector against the embeddings of both knowledge graph node labels and their associated facts using cosine similarity.
-  - **Episodic Semantic Search**: The agent queries past episodic dialogue history by comparing the user input's embedding against the cached episode vector embeddings, injecting the top matching dialogue turns directly into the prompt context.
+Those outputs become pressure signals. The analyzer does not directly decide
+what the entity says; it changes the internal field that later actions emerge
+from.
 
-## 4. Primitive Concept Engine (`primitive_concept_engine.py`)
-This layer sits *below* the LLM. It detects patterns purely through structural observation.
-Every tick, it captures a `StateSnapshot` (graph size, pressure values, active topics). It compares snapshots to detect "gaps" (e.g., topics that keep appearing without being resolved into the knowledge graph).
-When a gap persists, it generates "Concept Pressure". If this pressure crosses a threshold, the engine aggregates the facts and asks the LLM to name a **Tentative Concept**.
-Tentative concepts track `support` and `contradiction` over time. If they prove stable, they graduate to permanent nodes in the knowledge graph. This allows the system to learn structurally before it understands semantically.
+## Symbolic Pressure Memory
 
-## 5. Vision Sensor Layer (`vision_sensor.py`)
-The vision sensor layer provides the agent with ambient perception of its physical surroundings.
-- **Continuous Ambient Detection**: A background daemon thread captures frames at ~10 FPS. It computes human/face presence (using Haar cascades), motion level (using frame-by-frame pixel differences), scene changes, average brightness, and camera obstructions.
-- **Cognitive Integration**: These raw readings are converted into a descriptive natural-English text block (e.g., `[Visual Perception: A person is present and paying attention to you.]`). This context block is injected directly into the LLM prompts when the agent chats, thinks, or reaches out.
-- **Agent Identity**: The system-level prompt includes visual sensing capabilities, allowing the agent to naturally comment on visual changes (such as someone entering/leaving the room, moving, or blocking the camera) during interaction.
+`pressure_memory.py` is the symbolic memory layer.
 
+Extracted concepts enter a volatile pressure graph. Nodes and edges carry:
+
+- pressure;
+- stability;
+- volatility;
+- persistence;
+- activation history;
+- pathway diversity;
+- weighted relations.
+
+First-contact material is intentionally not projectable. It must be reactivated,
+connected, and stabilized before it can appear in prompt context or the
+compatibility knowledge graph.
+
+This preserves the rule: memory is pressure before it is storage.
+
+## Mycelial Field Memory
+
+`mycelial_field.py` is the resonance memory organ. It is adapted from the
+Mycelial Cortex idea, but stripped down into a dependency-free Python runtime.
+
+It provides:
+
+- sparse vector templates for concepts and relations;
+- content-addressable recall by similarity/resonance;
+- novelty growth when a pattern does not match existing nodes;
+- consolidation when a familiar pattern returns;
+- ATP-gated growth;
+- ordered sparse token emission;
+- chirality metadata (`chi`) for temporal direction;
+- merge-on-consolidate for redundant fragments.
+
+The field emits tokens with:
+
+- `seq`: ordered token sequence;
+- `tick`: engine tick;
+- `node`: winning node;
+- `prev_node`: previous winner;
+- `chi`: simple direction marker;
+- `payload`: sparse vector indices and values.
+
+This is the foundation for future federation. Ordered token delivery matters
+because sequence is part of experience.
+
+## Merge-on-Consolidate
+
+Fragmentation is a known risk. Without merging, similar patterns can spawn
+multiple nodes and consume the memory budget.
+
+The field now compares nodes during learning/settling. If two templates exceed
+the merge threshold, the stronger node absorbs the weaker one:
+
+- vectors blend;
+- facts merge;
+- activation and stability combine;
+- winner history is rewritten to the surviving node;
+- token history is updated;
+- a merge event is recorded.
+
+This keeps memory from shattering into redundant fragments.
+
+## Metabolism
+
+`metabolism.py` tracks:
+
+- ATP;
+- fatigue;
+- rest drive;
+- last demand;
+- total spent;
+- recall gain;
+- whether growth is currently allowed.
+
+Memory ingestion costs ATP. High fatigue or low ATP prevents new field growth.
+Research can be blocked when the organism is below its usable energy floor.
+
+Metabolism is therefore not decoration. It changes what the system can do.
+
+## Ecology Bridge
+
+`ecology_bridge.py` is the pressure-facing adapter for `computational-life`.
+
+It accepts metrics such as:
+
+- high-order entropy;
+- unique program count;
+- population size;
+- territorial dominance;
+- epoch.
+
+It maps them into pressure signals:
+
+- entropy shift feeds reflective pressure;
+- diversity feeds reflection/focus;
+- lineage flux feeds curiosity;
+- stagnation feeds contemplation;
+- novelty feeds curiosity.
+
+At present this bridge accepts metrics through `POST /api/ecology_metrics`. A
+dedicated Rust exporter for the `computational-life` repo is still a future
+piece.
+
+## Compatibility Knowledge Graph
+
+`knowledge_graph.py` remains as a compatibility and presentation layer. It is no
+longer the primary meaning of memory.
+
+Stable symbolic pressure memory can project into the graph. The graph then gives
+older UI and summary paths a familiar node/edge surface without reintroducing
+instant storage as the core memory model.
+
+## Vision
+
+`vision_sensor.py` accepts browser-camera frames and can optionally use a local
+camera if OpenCV is available.
+
+Vision state includes:
+
+- person presence;
+- face presence;
+- face count;
+- attention;
+- motion level;
+- brightness;
+- scene change;
+- camera blockage.
+
+Presence is used to satisfy absence pressure and ground prompts. If OpenCV is
+not available, the server can still boot in browser/no-camera mode.

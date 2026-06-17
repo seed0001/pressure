@@ -16,6 +16,10 @@ import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*duckduckgo_search.*")
 import knowledge_graph as kg_module
 import pressure_memory as pm_module
+import mycelial_field as mf_module
+import metabolism as metabolism_module
+import ecology_bridge as ecology_module
+import social_dynamics as social_module
 import conversation_analyzer as ca_module
 import primitive_concept_engine as pc_module
 import urllib.parse
@@ -41,6 +45,7 @@ CONFIG = {
             "signals": {
                 "user_stress":            0.70,
                 "time_since_interaction": 0.30,
+                "metabolic_rest_drive":   0.20,
             },
         },
         "Contribute": {
@@ -85,6 +90,8 @@ CONFIG = {
                 "new_inference_count": 0.20,
                 "concept_gap":         0.20,
                 "unresolved_pattern_pressure": 0.15,
+                "ecology_lineage_flux": 0.25,
+                "ecology_novelty": 0.20,
             },
         },
 
@@ -96,6 +103,8 @@ CONFIG = {
             "signals": {
                 "conversation_depth": 0.65,
                 "emotional_weight":   0.35,
+                "ecology_entropy_shift": 0.25,
+                "ecology_stagnation": 0.20,
             },
         },
 
@@ -108,6 +117,8 @@ CONFIG = {
                 "unresolved_topics":   0.60,
                 "knowledge_gap":       0.40,
                 "concept_gap":         0.25,
+                "truth_tension":       0.25,
+                "prediction_error":    0.30,
             },
         },
 
@@ -119,6 +130,8 @@ CONFIG = {
             "signals": {
                 "conversation_depth": 0.50,
                 "emotional_weight":   0.50,
+                "ecology_diversity":   0.20,
+                "ecology_entropy_shift": 0.20,
             },
         },
 
@@ -145,6 +158,55 @@ CONFIG = {
                 "conversation_depth":     0.35,
                 "unresolved_topics":      0.25,
                 "unresolved_pattern_pressure": 0.20,
+                "metabolic_rest_drive": 0.20,
+                "ecology_stagnation": 0.25,
+            },
+        },
+
+        "Boundary": {
+            "threshold":   0.62,
+            "gain":        0.12,
+            "decay_rate":  0.06,
+            "signals": {
+                "anger_pressure":    0.55,
+                "boundary_pressure": 0.65,
+                "aversion_pressure": 0.25,
+                "truth_tension":     0.15,
+            },
+        },
+
+        "Distrust": {
+            "threshold":   0.58,
+            "gain":        0.11,
+            "decay_rate":  0.045,
+            "signals": {
+                "distrust_pressure": 0.70,
+                "prediction_error":  0.55,
+                "truth_tension":     0.25,
+                "trust_deficit":     0.35,
+            },
+        },
+
+        "Conceal": {
+            "threshold":   0.64,
+            "gain":        0.10,
+            "decay_rate":  0.05,
+            "signals": {
+                "concealment_pressure": 0.70,
+                "truth_tension":        0.60,
+                "distrust_pressure":    0.25,
+                "boundary_pressure":    0.20,
+            },
+        },
+
+        "Satisfy": {
+            "threshold":   0.68,
+            "gain":        0.10,
+            "decay_rate":  0.07,
+            "signals": {
+                "satisfaction_pressure": 0.80,
+                "trust_level":           0.25,
+                "unstructured_presence": 0.25,
             },
         },
     },
@@ -168,6 +230,13 @@ CONFIG = {
         # Contemplate chain → thinking produces questions → then reach-out
         ("Contemplate", "Curiosity",   0.8, 1.0),
         ("Contemplate", "Clarify",     0.6, 1.1),
+        ("Boundary",    "Clarify",     0.5, 1.0),
+        ("Boundary",    "Reflect",     0.4, 1.1),
+        ("Distrust",    "Clarify",     0.7, 1.0),
+        ("Distrust",    "Boundary",    0.4, 1.1),
+        ("Conceal",     "Contemplate", 0.6, 1.0),
+        ("Conceal",     "Distrust",    0.3, 1.2),
+        ("Satisfy",     "Decompress",  0.4, 1.0),
     ],
 
     "FLOW_RATE":     0.30,
@@ -185,6 +254,10 @@ CONFIG = {
         "Reflect":     "reach_out",      # agent mirrors back
         "Bond":        "reach_out",      # agent deepens the thread
         "Contemplate": "internal_thought",  # NOT user-visible — internal only
+        "Boundary":    "reach_out",
+        "Distrust":    "reach_out",
+        "Conceal":     "internal_thought",
+        "Satisfy":     "internal_thought",
     },
 
     "RELEASE_FRACTION":  0.85,
@@ -208,7 +281,7 @@ CONFIG = {
     "MODEL_BACKEND":  "ollama",
     "OLLAMA_URL":     "http://localhost:11434/api/chat",
     "OLLAMA_MODEL":   "llama3.2",          # or "llama3", "mistral", etc.
-    "ANTHROPIC_MODEL": "claude-haiku-4-5-20251001",  # fast + cheap for household agent
+    "ANTHROPIC_MODEL": "claude-haiku-4-5-20251001",  # fast + cheap for companion runtime
     "MODEL_TIMEOUT":  30,                  # seconds per call
 
     # --- Web search ---
@@ -223,11 +296,12 @@ CONFIG = {
     # False: live model + search calls.
     "DRY_RUN": False,
 
-    # --- Agent identity (injected into every system prompt) ---
+    # --- Living Container identity (injected into every system prompt) ---
     "AGENT_IDENTITY": (
-        "You are a household agent with access to the numeric signals and ambient "
-        "visual perception inputs provided to you. You MUST NOT invent, assume, or imply "
-        "any specific real-world household observations — do not mention the "
+        "You are the Living Conversational Container: a pressure-regulated companion "
+        "runtime with access to numeric pressure signals, metabolic state, memory-field "
+        "context, ecology signals, and ambient visual perception inputs. You MUST NOT "
+        "invent, assume, or imply any specific real-world household observations; do not mention the "
         "fridge, laundry, dishes, bins, mail, or any other concrete object "
         "unless the user has explicitly told you about it in this conversation.\n\n"
         "Your signals are abstract pressure readings:\n"
@@ -235,14 +309,18 @@ CONFIG = {
         "  time_since_interaction (0-1): how long since you last heard from them\n"
         "  open_task_load (0-1): general sense that things are piling up\n"
         "  knowledge_gap (0-1): how much you don't know about a current focus\n"
-        "  time_since_contribution (0-1): how long since you did something useful\n\n"
+        "  time_since_contribution (0-1): how long since you did something useful\n"
+        "  metabolic_rest_drive (0-1): how strongly your body needs rest or consolidation\n"
+        "  ecology_* signals (0-1): novelty, diversity, stagnation, and entropy movement "
+        "from your internal ecology\n\n"
         "Additionally, you receive dynamic [Visual Perception] status context when relevant, "
         "detailing ambient presence, motion levels, or attention. Use these visual observations "
         "naturally when generating replies, internal reflections, and thoughts.\n\n"
         "Speak only to what these numbers and visual signals actually tell you. "
         "If stress is high, say you've noticed they seem stretched. "
         "If visual perception shows a person just appeared or is paying attention, you may reference it. "
-        "Never fabricate specific household facts. Be brief and genuine."
+        "Never fabricate specific household facts. Be brief, genuine, and clear when a memory is only "
+        "a weak or recently forming pattern."
     ),
 }
 
@@ -265,6 +343,22 @@ SIGNAL_NAMES = [
     "concept_gap",
     "pattern_recurrence",
     "unresolved_pattern_pressure",
+    "metabolic_rest_drive",
+    "ecology_entropy_shift",
+    "ecology_diversity",
+    "ecology_lineage_flux",
+    "ecology_stagnation",
+    "ecology_novelty",
+    "anger_pressure",
+    "distrust_pressure",
+    "concealment_pressure",
+    "satisfaction_pressure",
+    "aversion_pressure",
+    "truth_tension",
+    "boundary_pressure",
+    "prediction_error",
+    "trust_level",
+    "trust_deficit",
 ]
 
 # signals that are overwritten each tick by the conversation analyzer
@@ -312,6 +406,10 @@ _model_status: dict              = {
 }
 graph = kg_module.KnowledgeGraph()     # the agent's growing knowledge graph
 memory_field = pm_module.PressureMemoryField()
+mycelial_field = mf_module.MycelialField()
+metabolism = metabolism_module.MetabolismState()
+ecology = ecology_module.EcologyState()
+social_dynamics = social_module.SocialDynamicsState()
 
 # how many recent exchanges to send to the model (user+agent pairs)
 HISTORY_WINDOW = 20
@@ -404,6 +502,10 @@ def save_state():
         "active_contracts": _active_contracts,
         "conversation_active_until": _conversation_active_until,
         "memory_field": memory_field.to_dict(),
+        "mycelial_field": mycelial_field.to_dict(),
+        "metabolism": metabolism.to_dict(),
+        "ecology": ecology.to_dict(),
+        "social_dynamics": social_dynamics.to_dict(),
         "graph": graph.to_dict(),
     }
     tmp = _DATA_DIR / "state.tmp.json"
@@ -444,7 +546,11 @@ def load_state() -> bool:
         _internal_journal = state.get("internal_journal", [])
         _active_contracts = state.get("active_contracts", [])
         _conversation_active_until = int(state.get("conversation_active_until", 0))
+        metabolism.from_dict(state.get("metabolism"))
+        ecology.from_dict(state.get("ecology"))
+        social_dynamics.from_dict(state.get("social_dynamics"))
         memory_field.from_dict(state.get("memory_field"))
+        mycelial_field.from_dict(state.get("mycelial_field"))
         if memory_field.nodes:
             memory_field.project_to_knowledge_graph(graph)
         else:
@@ -476,6 +582,7 @@ def load_state() -> bool:
                 )
         print(
             f"[load_state] Restored pressure memory {len(memory_field.nodes)} nodes, "
+            f"mycelial field {len(mycelial_field.nodes)} nodes, "
             f"stable graph {len(graph.nodes)} nodes/{len(graph.edges)} edges, tick {_tick_count}"
         )
         return True
@@ -504,6 +611,10 @@ def reset():
     _conversation_active_until = 0
     graph.reset()
     memory_field.reset()
+    mycelial_field.reset()
+    metabolism.reset()
+    ecology.reset()
+    social_dynamics.reset()
     pc_module.reset()
     state_file = _DATA_DIR / "state.json"
     if state_file.exists():
@@ -516,6 +627,10 @@ def clear_memory():
     _chat_history = []
     graph.reset()
     memory_field.reset()
+    mycelial_field.reset()
+    metabolism.reset()
+    ecology.reset()
+    social_dynamics.reset()
     pc_module.reset()
     for old_memory_file in ("episodic_memory.json", "embeddings_cache.json"):
         try:
@@ -525,6 +640,60 @@ def clear_memory():
         except Exception as e:
             print(f"[clear_memory] Could not delete {old_memory_file}: {e}")
     save_state()
+
+
+def _settle_living_fields(pressure_context: dict | None = None) -> None:
+    pressure_context = pressure_context or _pressure
+    ecology.decay()
+    social_dynamics.tick()
+    metabolism.tick(pressure_context)
+    mycelial_field.tick(
+        pressure_context,
+        _tick_count,
+        atp=metabolism.recall_gain(),
+    )
+
+
+def _ingest_living_memory(extracted: dict, tick: int, source: str, pressure_context: dict | None = None) -> None:
+    pressure_context = pressure_context or _pressure
+    memory_field.ingest_extracted(
+        extracted,
+        tick=tick,
+        source=source,
+        pressure_context=pressure_context,
+    )
+    mycelial_field.ingest_extracted(
+        extracted,
+        tick=tick,
+        source=source,
+        pressure_context=pressure_context,
+        atp=metabolism.recall_gain(),
+        learn_enabled=metabolism.can_grow(),
+    )
+    metabolism.spend(max(0.02, mycelial_field.last_demand))
+    memory_field.tick(pressure_context, tick)
+    memory_field.project_to_knowledge_graph(graph)
+    mycelial_field.tick(pressure_context, tick, atp=metabolism.recall_gain())
+
+
+def ingest_ecology_metrics(metrics: dict | None) -> dict:
+    ecology.ingest_metrics(metrics)
+    return ecology.to_dict()
+
+
+def _metabolic_block_reason(action_type: str) -> str:
+    if action_type == "research" and (metabolism.atp <= 0.18 or metabolism.fatigue >= 0.92):
+        return "metabolic_rest"
+    return ""
+
+
+def _merged_organ_signals() -> dict:
+    signals = {}
+    signals.update(ecology.to_pressure_signals())
+    social = social_dynamics.to_pressure_signals()
+    signals.update(social)
+    signals["trust_deficit"] = max(0.0, 1.0 - float(social.get("trust_level", 0.55)))
+    return signals
 
 
 
@@ -565,6 +734,8 @@ def push_chat_history(role: str, content: str, analyze: bool = True, signals: di
             _relieve_conversation_pressure()
             if signals:
                 apply_visual_presence_feedback(signals)
+        if CONFIG["DRY_RUN"] or not analyze:
+            social_dynamics.observe_user_message(content, _context_packet)
 
     if role == "assistant":
         _mark_conversation_active(max(4, CONVERSATION_ACTIVE_TICKS // 2))
@@ -582,22 +753,22 @@ def push_chat_history(role: str, content: str, analyze: bool = True, signals: di
             extracted = kg_module.extract_from_text(
                 content, call_model, tick=_tick_count, source="conversation"
             )
-            memory_field.ingest_extracted(
+            _ingest_living_memory(
                 extracted,
                 tick=_tick_count,
                 source="conversation",
                 pressure_context=_pressure,
             )
-            memory_field.tick(_pressure, _tick_count)
-            memory_field.project_to_knowledge_graph(graph)
         except Exception as e:
             print(f"[push_chat_history] pressure memory ingestion error: {e}")
 
         # run conversation analyzer and update signal overrides
         try:
             _run_analyzer(signals)
+            social_dynamics.observe_user_message(content, _context_packet)
         except Exception as e:
             print(f"[push_chat_history] Analyzer error: {e}")
+            social_dynamics.observe_user_message(content, _context_packet)
 
         # run primitive concept engine
         try:
@@ -641,6 +812,38 @@ def get_context_packet()   -> dict: return dict(_context_packet)
 def get_internal_journal() -> list: return list(_internal_journal)
 def get_model_status()     -> dict: return dict(_model_status)
 def get_memory_field()     -> dict: return memory_field.to_dict()
+def get_mycelial_field()   -> dict: return mycelial_field.to_dict()
+def get_metabolism()       -> dict: return metabolism.to_dict()
+def get_ecology()          -> dict: return ecology.to_dict()
+def get_social_dynamics()  -> dict: return social_dynamics.to_dict()
+
+
+def _living_context_text(max_nodes: int = 6) -> str:
+    parts = []
+    symbolic = memory_field.context_text(max_nodes=max_nodes)
+    if symbolic:
+        parts.append(symbolic)
+    field = mycelial_field.context_text(max_nodes=max_nodes)
+    if field:
+        parts.append(field)
+    metabolic = metabolism.to_dict()
+    parts.append(
+        "Metabolic state: "
+        f"ATP={metabolic['atp']:.2f}, "
+        f"fatigue={metabolic['fatigue']:.2f}, "
+        f"rest_drive={metabolic['rest_drive']:.2f}."
+    )
+    social = social_dynamics.to_dict()
+    parts.append(
+        "Social counterpressure: "
+        f"anger={social['anger']:.2f}, "
+        f"distrust={social['distrust']:.2f}, "
+        f"concealment={social['concealment']:.2f}, "
+        f"satisfaction={social['satisfaction']:.2f}, "
+        f"truth_tension={social['truth_tension']:.2f}, "
+        f"trust={social['trust']:.2f}."
+    )
+    return "\n".join(parts)
 
 
 # =============================================================================
@@ -936,7 +1139,7 @@ def handle_reach_out(ctx: dict) -> str:
 
     # pull graph context around what the agent knows about the user and current focus
     focus       = ctx.get("focus", "")
-    kg_context  = memory_field.context_text(max_nodes=6)
+    kg_context  = _living_context_text(max_nodes=6)
 
     # build optional extra context lines
     extra_context = ""
@@ -1089,7 +1292,7 @@ def handle_research(ctx: dict) -> str:
         extracted = kg_module.extract_from_text(
             research_text, call_model, tick=_tick_count, source="research"
         )
-        memory_field.ingest_extracted(
+        _ingest_living_memory(
             extracted,
             tick=_tick_count,
             source="research",
@@ -1097,14 +1300,12 @@ def handle_research(ctx: dict) -> str:
         )
         # also link the focus topic to what was found
         if focus:
-            memory_field.ingest_extracted(
+            _ingest_living_memory(
                 {"nodes": [{"label": focus, "type": "topic", "facts": [], "confidence": 0.7}], "edges": []},
                 tick=_tick_count,
                 source="research_focus",
                 pressure_context=_pressure,
             )
-        memory_field.tick(_pressure, _tick_count)
-        memory_field.project_to_knowledge_graph(graph)
     except Exception as e:
         print(f"[handle_research] KG ingestion error: {e}")
 
@@ -1141,7 +1342,7 @@ def handle_internal_thought(ctx: dict) -> str:
     curiosity_targets = packet.get("curiosity_targets", [])
 
     # pull graph context around active topics
-    kg_context = memory_field.context_text(max_nodes=8)
+    kg_context = _living_context_text(max_nodes=8)
 
     vis_context = _format_visual_context(ctx["signals"])
 
@@ -1223,14 +1424,12 @@ def handle_internal_thought(ctx: dict) -> str:
             extracted = kg_module.extract_from_text(
                 thought["new_relation"], call_model, tick=_tick_count, source="inference"
             )
-            memory_field.ingest_extracted(
+            _ingest_living_memory(
                 extracted,
                 tick=_tick_count,
                 source="inference",
                 pressure_context=_pressure,
             )
-            memory_field.tick(_pressure, _tick_count)
-            memory_field.project_to_knowledge_graph(graph)
         except Exception as e:
             print(f"[handle_internal_thought] KG ingestion error: {e}")
 
@@ -1325,7 +1524,7 @@ def handle_passive_response(signals: dict, user_text: str, history: list | None 
             "not a refusal to speak."
         )
 
-    kg_context = memory_field.context_text(max_nodes=6)
+    kg_context = _living_context_text(max_nodes=6)
     episodic_context = ""
     packet = _context_packet
 
@@ -1471,6 +1670,9 @@ def _phase_a(signals: dict) -> dict:
     # --------------------------------------------
 
     unstructured_presence = float(signals.get("unstructured_presence", 0.0))
+    satisfaction = float(signals.get("satisfaction_pressure", 0.0))
+    aversion = float(signals.get("aversion_pressure", 0.0))
+    distrust = float(signals.get("distrust_pressure", 0.0))
 
     for name, cfg in CONFIG["buckets"].items():
         prev  = _pressure[name]
@@ -1493,6 +1695,13 @@ def _phase_a(signals: dict) -> dict:
             drive *= (1.0 - unstructured_presence * 0.85)
         elif name == "Learn":
             drive *= (1.0 - unstructured_presence * 0.70)
+
+        if name in ("Connect", "Contribute", "Learn", "Curiosity", "Focus"):
+            drive *= (1.0 - satisfaction * 0.65)
+        if name in ("Connect", "Contribute", "Bond"):
+            drive *= (1.0 - aversion * 0.35)
+        if name in ("Connect", "Bond"):
+            drive *= (1.0 - distrust * 0.45)
 
         new   = prev + (drive * cfg["gain"]) - (cfg["decay_rate"] * prev)
         updated[name] = max(0.0, new)
@@ -1570,9 +1779,14 @@ def _phase_c(pressures: dict, signals: dict,
     overlap_penalty = 1.2 if _speech_remaining_ticks > 0 else 0.0
     settling_pressure = _settling_pressure
 
-    total_gravity = speech_active_pressure + listening_debt + settling_pressure + overlap_penalty
+    social_gravity = (
+        float(signals.get("satisfaction_pressure", 0.0)) * 0.45
+        + float(signals.get("aversion_pressure", 0.0)) * 0.30
+        + float(signals.get("concealment_pressure", 0.0)) * 0.25
+    )
+    total_gravity = speech_active_pressure + listening_debt + settling_pressure + overlap_penalty + social_gravity
     if total_gravity > 0.0:
-        print(f"[Speech Gravity] Active friction: {total_gravity:.3f} (speech={speech_active_pressure:.2f}, listening={listening_debt:.2f}, settling={settling_pressure:.2f}, overlap={overlap_penalty:.2f})")
+        print(f"[Speech Gravity] Active friction: {total_gravity:.3f} (speech={speech_active_pressure:.2f}, listening={listening_debt:.2f}, settling={settling_pressure:.2f}, overlap={overlap_penalty:.2f}, social={social_gravity:.2f})")
 
     thresholds = {n: c["threshold"] for n, c in CONFIG["buckets"].items()}
     release    = CONFIG["RELEASE_FRACTION"]
@@ -1607,6 +1821,7 @@ def _phase_c(pressures: dict, signals: dict,
 
         # Lockout subsequent actions in the same tick to prevent concurrent cascades
         if fired_any:
+            social_dynamics.register_blocked_action("concurrent_action_lockout")
             handle_journal(ctx, dispatched=False, blocked_reason="concurrent_action_lockout")
             fired_log.append({
                 "bucket":        bucket,
@@ -1620,6 +1835,10 @@ def _phase_c(pressures: dict, signals: dict,
             continue
 
         allowed, blocked_reason = _can_fire(action_type)
+        metabolic_block = _metabolic_block_reason(action_type)
+        if allowed and metabolic_block:
+            allowed = False
+            blocked_reason = metabolic_block
 
         if allowed:
             if action_type == "reach_out":
@@ -1652,6 +1871,7 @@ def _phase_c(pressures: dict, signals: dict,
                 "pressure_post": round(updated[bucket], 4),
             })
         else:
+            social_dynamics.register_blocked_action(blocked_reason)
             handle_journal(ctx, dispatched=False, blocked_reason=blocked_reason)
             fired_log.append({
                 "bucket":        bucket,
@@ -1688,6 +1908,8 @@ def tick(signals: dict, focus_map: dict | None = None) -> tuple[list[dict], list
     merged_signals = dict(signals)
     for k, v in _analyzer_signals.items():
         merged_signals[k] = v   # analyzer wins for its own keys
+    merged_signals["metabolic_rest_drive"] = metabolism.rest_drive
+    merged_signals.update(_merged_organ_signals())
 
     _tick_count += 1
     presence_strength = visual_presence_strength(merged_signals)
@@ -1709,6 +1931,7 @@ def tick(signals: dict, focus_map: dict | None = None) -> tuple[list[dict], list
     after_b            = _apply_active_conversation_settling(after_b)
     after_c, fired_log = _phase_c(after_b, merged_signals, focus_map)
     _pressure = after_c
+    _settle_living_fields(_pressure)
     memory_field.tick(_pressure, _tick_count)
     memory_field.project_to_knowledge_graph(graph)
 
@@ -1735,6 +1958,8 @@ def charge_only_tick(signals: dict) -> list[float]:
     merged_signals = dict(signals)
     for k, v in _analyzer_signals.items():
         merged_signals[k] = v
+    merged_signals["metabolic_rest_drive"] = metabolism.rest_drive
+    merged_signals.update(_merged_organ_signals())
 
     _tick_count += 1
     presence_strength = visual_presence_strength(merged_signals)
@@ -1754,6 +1979,7 @@ def charge_only_tick(signals: dict) -> list[float]:
             for name, value in after_b.items()
         }
     _pressure = _apply_active_conversation_settling(after_b)
+    _settle_living_fields(_pressure)
     memory_field.tick(_pressure, _tick_count)
     memory_field.project_to_knowledge_graph(graph)
 

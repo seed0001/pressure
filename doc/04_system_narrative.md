@@ -1,11 +1,96 @@
-# Household Agent System Narrative
+# Living Container System Narrative
 
-The Household Agent is built on a continuous tick-based execution cycle that operates independently of user communication. Time progresses steadily, driving the agent's internal state forward even when no chat activity is present. The system is run through a Python server that hosts backend APIs, serves desktop and mobile diagnostic frontends, and handles live interactions. To ensure cross-version compatibility on Windows, the server automatically detects if it has been launched outside of its virtual environment and redirects its own process to run within the correct environment. This setup ensures all media, image, and vision dependencies remain stable, while a double-clickable start script simplifies starting the server in a persistent console.
+The Living Conversational Container is an experimental companion runtime built
+around the idea that conversation should be the surface of an internal life, not
+the whole system. It combines a pressure engine, a volatile-to-stable memory
+field, ATP/fatigue metabolism, visual presence, and an ecology bridge that can
+receive metrics from a computational-life substrate.
 
-At the core of the agent's decision-making process is a multi-bucket pressure engine that models internal needs. These buckets represent different conversational and processing urges, such as decompression, contribution, learning, and connection. During each tick, the system charges the buckets with environmental and visual signals, calculates structural flows of pressure between them along defined graph edges, and dispatches actions when any bucket's pressure crosses its specific threshold. Fired actions trigger proactive chat messages, internal thoughts, or web searches. To prevent the agent from spamming the user, successful actions immediately decompress eighty-five percent of their corresponding bucket's pressure. Additionally, a dynamic speech gravity system scales the cost of competing actions based on the remaining audio duration, listening debt, settling pressure, and overlap penalties, ensuring the environment feels heavier while speaking is active and preventing interruptions without relying on absolute timers or budget limits. An additional mechanism immediately reduces communication-related bucket pressures when the user sends a message, ensuring active interaction keeps the agent's behavior natural and respectful of the user's space.
+The system is not meant to prove consciousness. It is meant to create a runtime
+where internal state has consequences. The organism can become curious, tired,
+reflective, blocked, present, or saturated because of the mechanics moving
+underneath the conversation.
 
-The agent's long-term memory is structured as a directed knowledge graph consisting of semantic nodes and relationship edges. This graph stores conceptual relationships and verified facts that the agent extracts from user messages and web search results. Retrieval of knowledge graph concepts utilizes local vector embeddings via an Ollama service (with a robust 128-dimensional pseudo-random character-hash fallback), mapping queries to the most similar nodes and facts based on cosine similarity. Furthermore, the agent maintains an episodic dialogue memory that saves formatted history exchanges and matches them semantically to inject relevant past conversations into active response queries. A separate conversation analyzer runs in the background, utilizing a language model to transform the recent chat history and ambient visual signals into structured context packets. These packets assess active topics, emotional charges, and unresolved openings, converting them into numeric signals that drive the pressure engine. Beneath this cognitive layer sits a sub-cognitive primitive concept engine that monitors structural patterns over time. This engine tracks topic repetitions and concept pressure, generating tentative nodes in the graph that slowly confirm or weaken based on subsequent user feedback.
+## Body
 
-Visual perception is provided by a continuous vision sensor thread that processes device camera inputs. The loop monitors human presence, counts faces, measures motion levels, detects scene changes, and flags camera blockages or low-light situations. These structured signals are converted into concise sensory descriptions and injected directly into the language model's prompts for chats, reflections, and reach-outs, making the agent fully aware of its physical environment. If the camera is located on a remote system, the local camera thread can be disabled with a command-line argument, and a dedicated remote client script can run the video processing loop on the remote machine, sending lightweight state packets over the network to the server's API. This divided execution ensures the server boots instantly and handles all webcam integrations cleanly.
+The body is the pressure engine. Every tick, environmental signals and internal
+organs charge pressure buckets. Those pressures flow into each other, then may
+discharge as speech, research, or private thought.
 
-The user interfaces include a desktop dashboard and a mobile chat application. The desktop dashboard is designed for diagnostic visualization, showing live progress bars for bucket pressures, rendering the knowledge graph dynamically on a two-dimensional canvas, displaying internal journal logs, and providing camera toggles. The mobile interface provides a responsive, single-column chat UI that polls the server for state updates. To overcome mobile browser restrictions on playing synthetic audio asynchronously, the mobile UI instantiates and recycles a single audio element upon user interaction, allowing seamless text-to-speech feedback. This audio synthesis is performed by a background script that calls Microsoft Edge's services, piping the binary audio cleanly to the frontend without blocking the main server execution.
+This gives the system continuity. It is not only waiting for input. It has a
+small internal weather that continues to settle and change.
+
+## Memory
+
+Memory has two active organs.
+
+The symbolic pressure field receives extracted concepts and relations. It does
+not immediately believe that every first-contact fact is durable. New material
+must circulate, connect, and stabilize before it can become projected memory.
+
+The mycelial field receives the same extracted material as sparse resonance
+templates. It recalls by similarity, consolidates repeated signals, grows on
+novelty when energy allows, emits ordered sparse tokens, and merges redundant
+fragments. This gives the system a memory model closer to resonance than filing.
+
+## Metabolism
+
+Metabolism gives learning and research a cost.
+
+ATP falls when memory work happens. Fatigue rises under demand. Low ATP or high
+fatigue gates new memory growth and can block research. Rest drive then feeds
+pressure, making exhaustion part of the runtime rather than a decorative number.
+
+The point is not to simulate biology perfectly. The point is to make action
+physically consequential inside the software.
+
+## Ecology
+
+The ecology bridge is the first connection point for the `computational-life`
+substrate.
+
+The ecology is expected to produce entropy, diversity, lineage, dominance,
+stagnation, and novelty metrics. Those do not directly become words. They become
+pressure signals. For example, lineage flux can feed curiosity, entropy movement
+can feed reflection, and stagnation can feed contemplation.
+
+This is how the internal ecology becomes functional instead of decorative.
+
+## Presence
+
+Presence is treated as a live relational signal. Face or attention detection can
+relieve absence pressure while the user is visible. That relief is deliberately
+narrow: it should settle connection and decompression pressure without freezing
+learning, curiosity, or reflection.
+
+The preferred camera path is browser-device capture over HTTPS, because the
+server may not be the machine with the useful camera.
+
+## Expression
+
+The expression surface is chat, dashboard, mobile UI, and speech.
+
+Speech has gravity. While output is being received, competing actions become
+harder to fire. This keeps the system from interrupting itself or firing a
+cascade of actions in a single burst.
+
+The entity can also think privately. Internal thought is not shown directly to
+the user, but it can raise later pressure if it discovers a question or relation
+worth bringing back.
+
+## Current Shape
+
+The current implementation is a first runnable merge. It has the pressure spine,
+symbolic pressure memory, mycelial field memory, metabolism, browser vision
+hooks, ecology metric ingestion, and the inherited dashboard/mobile surfaces.
+
+The next major work is to connect a real `computational-life` exporter, finish
+ordered token federation across instances, and build UI panels that show the new
+organs clearly.
+
+## Guiding Constraint
+
+When possible, do not hard-code aliveness. Route it through pressure, resonance,
+metabolic cost, ecology, and presence. The system should develop behavior
+because its internal state is changing, not because a prompt asks it to perform
+being alive.

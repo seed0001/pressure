@@ -1,9 +1,17 @@
 import os
 os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
-import cv2
 import threading
 import time
-import numpy as np
+
+try:
+    import cv2
+    import numpy as np
+except Exception as e:
+    cv2 = None
+    np = None
+    _VISION_IMPORT_ERROR = str(e)
+else:
+    _VISION_IMPORT_ERROR = ""
 
 _lock = threading.Lock()
 
@@ -26,10 +34,11 @@ _thread = None
 _running = False
 
 _face_cascade = None
-try:
-    _face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-except Exception as e:
-    print(f"[Vision] Error loading global face cascade: {e}")
+if cv2 is not None:
+    try:
+        _face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    except Exception as e:
+        print(f"[Vision] Error loading global face cascade: {e}")
 
 _browser_prev_gray = None
 _latest_frame_jpeg = None
@@ -265,6 +274,10 @@ def start():
     global _thread, _running
     if _running:
         return
+    if cv2 is None or np is None:
+        set_idle("none", f"OpenCV unavailable: {_VISION_IMPORT_ERROR}")
+        print(f"[Vision] OpenCV unavailable; local camera disabled: {_VISION_IMPORT_ERROR}")
+        return
     _running = True
     _thread = threading.Thread(target=_vision_loop, daemon=True, name="VisionSensorThread")
     _thread.start()
@@ -280,6 +293,9 @@ def process_frame(frame) -> dict:
     """Process a single frame from the web browser. Updates the global visual state."""
     global _browser_prev_gray, _latest_frame_jpeg, _latest_frame_time, _state
     if frame is None:
+        return get_current_state()
+    if cv2 is None or np is None:
+        set_idle("browser", f"OpenCV unavailable: {_VISION_IMPORT_ERROR}")
         return get_current_state()
     
     # Cache the latest browser frame as JPEG

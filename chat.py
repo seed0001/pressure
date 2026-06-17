@@ -1,5 +1,5 @@
 """
-Household agent — interactive chat loop.
+Living Container - interactive chat loop.
 
 Run:  python chat.py
       python chat.py --model mistral:latest
@@ -21,7 +21,7 @@ except Exception:
     pass
 
 # ── CLI args ─────────────────────────────────────────────────────────────────
-parser = argparse.ArgumentParser(description="Household agent chat")
+parser = argparse.ArgumentParser(description="Living Container chat")
 parser.add_argument("--model",  default=None, help="Ollama model name")
 parser.add_argument("--live",   action="store_true", help="Disable DRY_RUN (make real model calls)")
 parser.add_argument("--focus",  default="general household needs", help="Starting focus subject")
@@ -292,7 +292,7 @@ def main():
     pe.reset()
 
     print(f"""
-{BOLD}Household agent{RESET}
+{BOLD}Living Container{RESET}
 Model : {pe.CONFIG['OLLAMA_MODEL']}
 Mode  : {'LIVE' if not pe.CONFIG['DRY_RUN'] else 'DRY RUN  (use --live or /live to enable real calls)'}
 Focus : {focus_subject}

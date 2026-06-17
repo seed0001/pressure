@@ -1,8 +1,8 @@
 """
-Remote Vision Client for Household Agent.
+Remote Vision Client for Living Container.
 Run this script on the remote system with the webcam attached.
 It performs local OpenCV vision processing and POSTs the structured state
-to the main Household Agent server.
+to the main Living Container server.
 
 Usage:
   python remote_vision_client.py --server http://<agent-server-ip>:7437
@@ -19,7 +19,7 @@ import json
 import argparse
 
 def main():
-    parser = argparse.ArgumentParser(description="Remote Vision Client for Household Agent")
+    parser = argparse.ArgumentParser(description="Remote Vision Client for Living Container")
     parser.add_argument("--server", default="http://localhost:7437", help="URL of the agent server")
     parser.add_argument("--cam", type=int, default=0, help="Camera index to use")
     parser.add_argument("--fps", type=float, default=10.0, help="Target frames per second")
